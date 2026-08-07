@@ -11,6 +11,7 @@ import boto3
 import pandas as pd
 import numpy as np
 from scipy.stats import t
+from prometheus_api_client import PrometheusConnect, MetricRangeDataFrame
 
 
 
@@ -73,7 +74,7 @@ def is_locust_db(file_info):
     return is_db_path and s3_key.endswith(".db")
 
 def parse_locust_db_file_info(file_info):
-    """Parse a locust DB key to extract the experiment name"""
+    """Parse a locust DB key to extract the trial, role, and filename"""
     s3_key = file_info["Key"]
     parts = s3_key.split("/")
     trial, filename = parts[-3], parts[-1]
@@ -81,14 +82,13 @@ def parse_locust_db_file_info(file_info):
     return trial, role, filename
 
 def parse_roundtrip_file_info(file_info):
-    """Parse a locust DB key to extract the experiment name"""
+    """Parse a roundtrip file key to extract the trial and filename"""
     s3_key = file_info["Key"]
     parts = s3_key.split("/")
     trial, filename = parts[-3], parts[-1]
     return trial, filename
 
     
-
 def create_log_database(db_path):
     """Creates the log database"""
 
@@ -148,7 +148,7 @@ def get_log_as_dataframe(filename):
 def get_run_details(s3_bucket, run_id, trial_id, verbose=False):
     """Get the run details from S3"""
     key = f"{run_id}/{trial_id}/run_details.json"
-    obj = boto3.client('s3').get_object(Bucket=s3_bucket, Key=key)
+    obj = s3.get_object(Bucket=s3_bucket, Key=key)
     return json.loads(obj['Body'].read())
 
 
@@ -796,3 +796,121 @@ def add_weighted_tau(summary_df_by_autoscaler, gamma=0.50, omega=0.50):
     # Weight response time and failure rate by omega
     summary_df_by_autoscaler["tau_mean"] = omega * summary_df_by_autoscaler["tau_rt_mean"] + (1 - omega) * summary_df_by_autoscaler["tau_fr_mean"]
     return summary_df_by_autoscaler
+
+def parse_metric_file_info(file_info):
+    """Parse a metric file key to extract the trial and filename"""
+    s3_key = file_info["Key"]
+    parts = s3_key.split("/")
+    trial, filename = parts[-3], parts[-1]
+    return trial, filename
+
+
+def get_merged_range_metric_df(files, run_id, s3_bucket, metric, column_label):
+        
+    metrics_df = None
+
+    for file in files:
+        # select the metrics file to process
+        if f"metrics/{metric}" in file["Key"]:
+            # parse the trial and filename from the s3 key
+            trial, filename = parse_metric_file_info(file)
+
+            # Fetch object content directly from S3 using boto3
+            response = s3.get_object(Bucket=s3_bucket, Key=file["Key"])
+            content_bytes = response["Body"].read()
+
+            # Decode bytes to string and then parse as JSON
+            content = json.loads(content_bytes)["data"]["result"]
+            # content = content["data"]["result"]
+            
+            # Read JSON into pandas 
+            temp_df = MetricRangeDataFrame(content)
+
+            # Reset index
+            temp_df = temp_df.reset_index()
+
+            # Add trial_id column to roundtrip df
+            temp_df["trial_id"] = trial
+
+            # Get the run details
+            run_details = get_run_details(s3_bucket, run_id, trial)
+
+            # Get the autoscaler
+            autoscaler = get_autoscaler(run_details)
+            temp_df["autoscaler"] = autoscaler
+
+            #  concat roundtrip df with existing roundtrip_df
+            if metrics_df is None:
+                metrics_df = temp_df
+            else:
+                metrics_df = pd.concat([metrics_df, temp_df], ignore_index=True)
+
+    
+    # remove unnecessary columns
+    # merged_trial_summary_df = merged_trial_summary_df[['autoscaler', 'trial_id', 'requests', 'mean_response_time', 'failures',
+    #     'failure_rate', 'roundtrip_completion_percentage']]
+    
+    return metrics_df.rename(columns={"value": column_label})
+
+def calculate_async_mean_time_by_autoscaler(async_df, column_label):
+    async_df = async_df.copy()
+    async_df["time"] = pd.to_datetime(async_df["timestamp"])
+    async_df = async_df.sort_values(by=["trial_id", "time"])
+
+    # group by autoscaler and trial_id and calculate the mean of the async_processing_time
+    mean_time_by_trial_df = async_df.groupby(["autoscaler", "trial_id"])["value"].mean().to_frame()
+    
+    # # merge the mean time back to the original dataframe
+    # async_df = async_df.merge(mean_time_by_trial, on="trial_id", how="left", suffixes=("", "_mean"))
+
+    # group by autoscaler and calculate the mean of the mean_time_by_trial
+    mean_time_by_autoscaler_df = mean_time_by_trial_df.groupby("autoscaler")["value"].mean().to_frame()
+
+    # rename the value column to the column_label
+    mean_time_by_autoscaler_df = mean_time_by_autoscaler_df.rename(columns={"value": column_label})
+
+    return mean_time_by_autoscaler_df
+
+def calculate_async_utilization_by_autoscaler(files, run_id, s3_bucket, time_slice_seconds=15):
+    metrics = ["kafka_consumer_idle_seconds_total-service_name-topic",
+                "kafka_consumer_processing_seconds_total-service_name-topic"]
+    labels = ["idle", "processing"]
+    utilization_df = None
+    for metric, label in zip(metrics, labels):
+        temp_df = get_merged_range_metric_df(files, run_id, s3_bucket, metric, label)
+        min_timestamp = temp_df.timestamp.min()
+        max_timestamp = temp_df.timestamp.max()
+        temp_df["timestamp"] = pd.to_datetime(temp_df["timestamp"])
+        
+        
+        # Calculate interval_range from the lowest start time to the highest start time of the dataframe
+        time_slice_index = pd.interval_range(
+            start=min_timestamp,
+            end=max_timestamp,
+            freq=pd.Timedelta(seconds=time_slice_seconds),
+            name="time_slice",
+        )
+
+        # Assign each row to a time slice based on start_time
+        temp_df["time_slice"] = pd.cut(
+            temp_df.timestamp,
+            bins=time_slice_index,
+            include_lowest=True, 
+            labels=time_slice_index[:],
+        )
+
+        
+        if utilization_df is None:
+            utilization_df = temp_df
+        else:
+            # merge idle and processing times
+            utilization_df = utilization_df.merge(temp_df, on=["autoscaler", "service_name", "topic", "trial_id",  "time_slice"], how="outer")
+            # drop column timestamp_y
+            utilization_df = utilization_df.drop(columns=["timestamp_y"])
+            # rename timestamp_x to timestamp
+            utilization_df = utilization_df.rename(columns={"timestamp_x": "timestamp"})
+            # reorder columns to timestamp, trial_id, autoscaler, service_name, topic, time_slice, idle, processing
+            utilization_df = utilization_df[["timestamp", "trial_id", "autoscaler", "service_name", "topic", "time_slice", "idle", "processing"]]
+            # calculate u_t as processing/(processing + idle)
+            utilization_df["u_t"] = utilization_df["processing"]/(utilization_df["processing"] + utilization_df["idle"])
+    return utilization_df, min_timestamp, max_timestamp, time_slice_seconds
