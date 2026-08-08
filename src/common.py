@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import os
+import datetime
 import sqlite3
 import json
 from dataclasses import dataclass
@@ -87,6 +88,15 @@ def parse_roundtrip_file_info(file_info):
     parts = s3_key.split("/")
     trial, filename = parts[-3], parts[-1]
     return trial, filename
+
+def parse_run_details_file_info(file_info):
+    """Parse a run details file key to extract the trial and filename"""
+    s3_key = file_info["Key"]
+    parts = s3_key.split("/")
+    trial, filename = parts[-2], parts[-1]
+    return trial, filename
+
+
 
     
 def create_log_database(db_path):
@@ -495,7 +505,7 @@ def calculate_theta_metrics(
     )    
 
 
-def append_time_slice(df, time_slice_seconds=30):
+def append_time_slice(df, earliest_start_time, latest_end_time, time_slice_seconds=30):
     """Append a time_slice column to the dataframe."""
     
     # Make a copy of the dataframe
@@ -503,22 +513,23 @@ def append_time_slice(df, time_slice_seconds=30):
 
     # Convert start_time to datetime and subtract the minimum start_time to get a timedelta
     df["start_time_dt"] = pd.to_datetime(df.start_time)
-    min_start = df.start_time_dt.min()
-    df.start_time_dt = df.start_time_dt - min_start
-    min_start = min_start - min_start
-    print(f"min_start = {min_start}")
+    # min_start = df.start_time_dt.min()
+    # df.start_time_dt = df.start_time_dt - min_start
+    # min_start = min_start - min_start
+    # print(f"min_start = {min_start}")
 
     # Calculate the maximum start time
-    max_start = df.start_time_dt.max()
+    # max_start = df.start_time_dt.max()
 
     # Increment max_start by one time slice
-    max_start = max_start + pd.Timedelta(seconds=time_slice_seconds)
-    print(f"max_start = {max_start}")
+    # max_start = max_start + pd.Timedelta(seconds=time_slice_seconds)
+    # print(f"max_start = {max_start}")
+    latest_end_time = latest_end_time + pd.Timedelta(seconds=time_slice_seconds)
 
     # Calculate interval_range from the lowest start time to the highest start time of the dataframe
     time_slice_index = pd.interval_range(
-        start=min_start,
-        end=max_start,
+        start=earliest_start_time,
+        end=latest_end_time,
         freq=pd.Timedelta(seconds=time_slice_seconds),
         name="time_slice",
     )
@@ -871,22 +882,26 @@ def calculate_async_mean_time_by_autoscaler(async_df, column_label):
 
     return mean_time_by_autoscaler_df
 
-def calculate_async_utilization_by_autoscaler(files, run_id, s3_bucket, time_slice_seconds=15):
+def calculate_async_utilization_by_autoscaler(files, run_id, s3_bucket, earliest_start_time, latest_end_time, time_slice_seconds=15):
     metrics = ["kafka_consumer_idle_seconds_total-service_name-topic",
                 "kafka_consumer_processing_seconds_total-service_name-topic"]
     labels = ["idle", "processing"]
     utilization_df = None
     for metric, label in zip(metrics, labels):
         temp_df = get_merged_range_metric_df(files, run_id, s3_bucket, metric, label)
-        min_timestamp = temp_df.timestamp.min()
-        max_timestamp = temp_df.timestamp.max()
-        temp_df["timestamp"] = pd.to_datetime(temp_df["timestamp"])
+        # min_timestamp = temp_df.timestamp.min()
+        # max_timestamp = temp_df.timestamp.max()
+        # temp_df["timestamp"] = pd.to_datetime(temp_df["timestamp"])
+        temp_df["timestamp"] = pd.to_datetime(temp_df["timestamp"], unit="s", utc=True).astype('datetime64[us, UTC]')
+
         
         
         # Calculate interval_range from the lowest start time to the highest start time of the dataframe
         time_slice_index = pd.interval_range(
-            start=min_timestamp,
-            end=max_timestamp,
+            # start=min_timestamp,
+            # end=max_timestamp,
+            start=earliest_start_time,
+            end=latest_end_time,
             freq=pd.Timedelta(seconds=time_slice_seconds),
             name="time_slice",
         )
@@ -913,4 +928,28 @@ def calculate_async_utilization_by_autoscaler(files, run_id, s3_bucket, time_sli
             utilization_df = utilization_df[["timestamp", "trial_id", "autoscaler", "service_name", "topic", "time_slice", "idle", "processing"]]
             # calculate u_t as processing/(processing + idle)
             utilization_df["u_t"] = utilization_df["processing"]/(utilization_df["processing"] + utilization_df["idle"])
-    return utilization_df, min_timestamp, max_timestamp, time_slice_seconds
+    return utilization_df, time_slice_seconds
+
+
+def get_run_start_and_end_times(files, s3_bucket, run_id):
+    """ Retrieves the earliest benchmark start time and the latest benchmark end time.  
+    Used to determine consistent time slices for merging data by time slice. """
+    
+    earliest_start = datetime.datetime.max.replace(tzinfo=datetime.timezone.utc)
+    latest_end = datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
+    
+    # Iterate file infos
+    for file in files:
+        if "run_details.json" in file["Key"]:
+            # parse the file info for the trial id
+            trial_id, _ = parse_run_details_file_info(file)
+            # get the run details for the trial
+            run_details = get_run_details(s3_bucket, run_id, trial_id, verbose=False)
+            # extract the start and end time
+            start = datetime.datetime.fromisoformat(run_details['status']['startTime'].replace('Z', '+00:00'))
+            end = datetime.datetime.fromisoformat(run_details['status']['endTime'].replace('Z', '+00:00'))
+            # compare to the current earliest start and latest end time
+            earliest_start = min(earliest_start, start)
+            latest_end = max(latest_end, end)
+    
+    return earliest_start, latest_end
