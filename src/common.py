@@ -2257,3 +2257,557 @@ def plot_cpu_saturation_time_share(
         trial_summary,
         autoscaler_summary,
     )
+
+
+
+def prepare_cpu_requested_vs_usage(
+    cluster_cpu_requested_df,
+    cluster_cpu_usage_df,
+    bin_seconds=60,
+):
+    """
+    Merge requested and actual CPU ratios and identify the most
+    CPU-request-saturated node at each trial/time.
+
+    Both input `value` columns are assumed to be ratios relative to
+    allocatable CPU:
+        1.0 = 100% of allocatable CPU.
+
+    Returns
+    -------
+    matched : DataFrame
+        Node-level matched requested/usage observations.
+
+    pressure : DataFrame
+        At each trial/time, the node with the greatest requested CPU ratio.
+
+    binned : DataFrame
+        60-second (by default) means of pressure-node requested/usage ratios.
+    """
+
+    requested = cluster_cpu_requested_df.copy()
+    usage = cluster_cpu_usage_df.copy()
+
+    keys = [
+        "run_id",
+        "trial_id",
+        "autoscaler",
+        "node",
+        "elapsed_seconds",
+    ]
+
+    requested["value"] = pd.to_numeric(
+        requested["value"], errors="coerce"
+    )
+    usage["value"] = pd.to_numeric(
+        usage["value"], errors="coerce"
+    )
+
+    requested["elapsed_seconds"] = pd.to_numeric(
+        requested["elapsed_seconds"], errors="coerce"
+    )
+    usage["elapsed_seconds"] = pd.to_numeric(
+        usage["elapsed_seconds"], errors="coerce"
+    )
+
+    requested = requested.dropna(
+        subset=keys + ["value"]
+    )
+    usage = usage.dropna(
+        subset=keys + ["value"]
+    )
+
+    # Rename before merge.
+    requested = requested[keys + ["value"]].rename(
+        columns={"value": "requested_ratio"}
+    )
+
+    usage = usage[keys + ["value"]].rename(
+        columns={"value": "usage_ratio"}
+    )
+
+    # ----------------------------------------------------------
+    # Match node-for-node and time-for-time
+    # ----------------------------------------------------------
+
+    matched = requested.merge(
+        usage,
+        on=keys,
+        how="inner",
+        validate="one_to_one",
+    )
+
+    matched["reservation_gap"] = (
+        matched["requested_ratio"]
+        - matched["usage_ratio"]
+    )
+
+    # ----------------------------------------------------------
+    # At each timestamp, select the node under greatest
+    # scheduling pressure: max requested / allocatable.
+    # ----------------------------------------------------------
+
+    group_keys = [
+        "run_id",
+        "trial_id",
+        "autoscaler",
+        "elapsed_seconds",
+    ]
+
+    idx = (
+        matched.groupby(
+            group_keys,
+            observed=True,
+        )["requested_ratio"]
+        .idxmax()
+    )
+
+    pressure = (
+        matched.loc[idx]
+        .sort_values(group_keys)
+        .reset_index(drop=True)
+    )
+
+    # Unique trial identifier in case trial_id is reused.
+    pressure["trial"] = (
+        pressure["run_id"].astype(str)
+        + "/"
+        + pressure["trial_id"].astype(str)
+    )
+
+    # ----------------------------------------------------------
+    # Bin for visualization
+    # ----------------------------------------------------------
+
+    pressure["time_bin"] = (
+        np.floor(
+            pressure["elapsed_seconds"] / bin_seconds
+        ) * bin_seconds
+        + bin_seconds / 2
+    )
+
+    binned = (
+        pressure.groupby(
+            [
+                "run_id",
+                "trial_id",
+                "trial",
+                "autoscaler",
+                "time_bin",
+            ],
+            observed=True,
+            as_index=False,
+        )
+        .agg(
+            requested_ratio=("requested_ratio", "mean"),
+            usage_ratio=("usage_ratio", "mean"),
+        )
+    )
+
+    binned["reservation_gap"] = (
+        binned["requested_ratio"]
+        - binned["usage_ratio"]
+    )
+
+    return matched, pressure, binned
+
+
+def summarize_cpu_time_series(cpu_binned):
+    """
+    Calculate across-trial mean and Student's-t 95% CI for
+    requested and actual CPU ratios.
+    """
+
+    long = cpu_binned.melt(
+        id_vars=[
+            "run_id",
+            "trial_id",
+            "trial",
+            "autoscaler",
+            "time_bin",
+        ],
+        value_vars=[
+            "requested_ratio",
+            "usage_ratio",
+        ],
+        var_name="metric",
+        value_name="ratio",
+    )
+
+    summary = (
+        long.groupby(
+            ["autoscaler", "time_bin", "metric"],
+            observed=True,
+        )["ratio"]
+        .agg(["mean", "std", "count"])
+        .reset_index()
+    )
+
+    summary["se"] = (
+        summary["std"]
+        / np.sqrt(summary["count"])
+    )
+
+    summary["t_crit"] = stats.t.ppf(
+        0.975,
+        df=summary["count"] - 1,
+    )
+
+    summary.loc[
+        summary["count"] < 2, "t_crit"
+    ] = np.nan
+
+    summary["ci"] = (
+        summary["t_crit"] * summary["se"]
+    )
+
+    summary["ci_low"] = (
+        summary["mean"] - summary["ci"]
+    )
+
+    summary["ci_high"] = (
+        summary["mean"] + summary["ci"]
+    )
+
+    return summary
+
+
+def plot_cpu_requested_vs_usage(
+    cpu_binned,
+    autoscaler_order=("none", "hpa", "vpa", "keda"),
+    figsize=None,
+):
+    summary = summarize_cpu_time_series(cpu_binned)
+
+    present = set(summary["autoscaler"].unique())
+
+    autoscalers = [
+        a for a in autoscaler_order
+        if a in present
+    ]
+    autoscalers += sorted(
+        present - set(autoscalers)
+    )
+
+    n = len(autoscalers)
+
+    if figsize is None:
+        figsize = (7.2, 2.35 * n)
+
+    fig, axes = plt.subplots(
+        n,
+        1,
+        figsize=figsize,
+        sharex=True,
+        sharey=True,
+        constrained_layout=True,
+    )
+
+    if n == 1:
+        axes = np.array([axes])
+
+    # Use matplotlib defaults rather than hard-coded colors.
+    default_colors = plt.rcParams[
+        "axes.prop_cycle"
+    ].by_key()["color"]
+
+    metric_styles = {
+        "requested_ratio": {
+            "label": "Requested",
+            "color": default_colors[0],
+        },
+        "usage_ratio": {
+            "label": "Actual usage",
+            "color": default_colors[1],
+        },
+    }
+
+    for ax, autoscaler in zip(
+        axes, autoscalers
+    ):
+
+        subset = summary[
+            summary["autoscaler"] == autoscaler
+        ]
+
+        for metric, style in metric_styles.items():
+
+            s = subset[
+                subset["metric"] == metric
+            ].sort_values("time_bin")
+
+            x = s["time_bin"] / 60
+
+            # Confidence interval
+            ax.fill_between(
+                x,
+                s["ci_low"] * 100,
+                s["ci_high"] * 100,
+                color=style["color"],
+                alpha=0.12,
+                linewidth=0,
+            )
+
+            # Mean
+            ax.plot(
+                x,
+                s["mean"] * 100,
+                color=style["color"],
+                linewidth=2.0,
+                label=style["label"],
+            )
+
+        # 95% scheduling-pressure reference
+        ax.axhline(
+            95,
+            linestyle="--",
+            linewidth=1.0,
+        )
+
+        # 100% allocatable CPU
+        ax.axhline(
+            100,
+            linestyle=":",
+            linewidth=1.0,
+        )
+
+        title = (
+            "No autoscaler"
+            if autoscaler == "none"
+            else autoscaler.upper()
+        )
+
+        ax.set_title(
+            title,
+            loc="left",
+            fontweight="bold",
+        )
+
+        ax.set_ylabel(
+            "Allocatable CPU (%)"
+        )
+
+        ax.grid(
+            axis="y",
+            alpha=0.20,
+            linewidth=0.6,
+        )
+
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+
+    axes[0].legend(
+        frameon=False,
+        ncol=2,
+        loc="upper left",
+    )
+
+    axes[-1].set_xlabel(
+        "Elapsed time (minutes)"
+    )
+
+    fig.suptitle(
+        "Requested and Actual CPU on the Most "
+        "Request-Saturated Node",
+        fontweight="bold",
+    )
+
+    return fig, axes, summary
+
+
+def plot_cpu_reservation_gap(
+    cpu_pressure,
+    autoscaler_order=("none", "hpa", "vpa", "keda"),
+    figsize=(7, 5),
+    jitter=0.08,
+):
+    """
+    Trial-level mean difference between requested CPU and
+    actual CPU usage on the most request-saturated node.
+    """
+
+    trial_summary = (
+        cpu_pressure.groupby(
+            ["run_id", "trial_id", "autoscaler"],
+            observed=True,
+            as_index=False,
+        )
+        .agg(
+            mean_requested_ratio=(
+                "requested_ratio", "mean"
+            ),
+            mean_usage_ratio=(
+                "usage_ratio", "mean"
+            ),
+            mean_reservation_gap=(
+                "reservation_gap", "mean"
+            ),
+        )
+    )
+
+    trial_summary["reservation_gap_pct"] = (
+        trial_summary["mean_reservation_gap"]
+        * 100
+    )
+
+    # ----------------------------------------------------------
+    # Autoscaler summary
+    # ----------------------------------------------------------
+
+    summary = (
+        trial_summary.groupby(
+            "autoscaler",
+            observed=True,
+        )["reservation_gap_pct"]
+        .agg(["mean", "std", "count"])
+        .reset_index()
+    )
+
+    summary["se"] = (
+        summary["std"]
+        / np.sqrt(summary["count"])
+    )
+
+    summary["t_crit"] = stats.t.ppf(
+        0.975,
+        df=summary["count"] - 1,
+    )
+
+    summary.loc[
+        summary["count"] < 2,
+        "t_crit",
+    ] = np.nan
+
+    summary["ci"] = (
+        summary["t_crit"]
+        * summary["se"]
+    )
+
+    # ----------------------------------------------------------
+    # Plotting order
+    # ----------------------------------------------------------
+
+    present = set(
+        trial_summary["autoscaler"].unique()
+    )
+
+    autoscalers = [
+        a for a in autoscaler_order
+        if a in present
+    ]
+
+    autoscalers += sorted(
+        present - set(autoscalers)
+    )
+
+    x_positions = np.arange(
+        len(autoscalers)
+    )
+
+    fig, ax = plt.subplots(
+        figsize=figsize,
+        constrained_layout=True,
+    )
+
+    rng = np.random.default_rng(42)
+
+    # ----------------------------------------------------------
+    # Plot individual trials + mean/CI
+    # ----------------------------------------------------------
+
+    for x, autoscaler in zip(
+        x_positions,
+        autoscalers,
+    ):
+
+        trials = trial_summary[
+            trial_summary["autoscaler"]
+            == autoscaler
+        ]
+
+        s = summary[
+            summary["autoscaler"]
+            == autoscaler
+        ].iloc[0]
+
+        x_jittered = (
+            x
+            + rng.uniform(
+                -jitter,
+                jitter,
+                len(trials),
+            )
+        )
+
+        # Individual trials
+        ax.scatter(
+            x_jittered,
+            trials["reservation_gap_pct"],
+            s=35,
+            alpha=0.45,
+            zorder=2,
+        )
+
+        # Mean
+        ax.scatter(
+            x,
+            s["mean"],
+            s=90,
+            marker="D",
+            edgecolor="black",
+            linewidth=0.8,
+            zorder=4,
+        )
+
+        # Student's-t 95% CI
+        if np.isfinite(s["ci"]):
+            ax.errorbar(
+                x,
+                s["mean"],
+                yerr=s["ci"],
+                fmt="none",
+                capsize=5,
+                linewidth=1.5,
+                zorder=3,
+            )
+
+    labels = [
+        (
+            "No autoscaler"
+            if a == "none"
+            else a.upper()
+        )
+        for a in autoscalers
+    ]
+
+    ax.set_xticks(x_positions)
+    ax.set_xticklabels(labels)
+
+    ax.axhline(
+        0,
+        linewidth=0.8,
+        linestyle=":",
+    )
+
+    ax.set_xlabel("Autoscaler")
+
+    ax.set_ylabel(
+        "Requested − actual CPU\n"
+        "(percentage points of allocatable CPU)"
+    )
+
+    ax.set_title(
+        "Trial-Level CPU Reservation Gap",
+        fontweight="bold",
+    )
+
+    ax.grid(
+        axis="y",
+        alpha=0.20,
+        linewidth=0.6,
+    )
+
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+    return fig, ax, trial_summary, summary
