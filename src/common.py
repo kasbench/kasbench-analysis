@@ -6,6 +6,13 @@ import datetime
 import sqlite3
 import json
 from dataclasses import dataclass
+import re
+import requests
+import time
+import shutil
+import tempfile
+from urllib.parse import urlparse
+
 
 
 import boto3
@@ -13,6 +20,8 @@ import pandas as pd
 import numpy as np
 from scipy.stats import t
 from prometheus_api_client import PrometheusConnect, MetricRangeDataFrame
+import matplotlib.pyplot as plt
+from scipy import stats
 
 
 
@@ -95,6 +104,12 @@ def parse_run_details_file_info(file_info):
     parts = s3_key.split("/")
     trial, filename = parts[-2], parts[-1]
     return trial, filename
+
+def parse_snapshot_name(snapshot: str) -> tuple[str, str]:
+    """Parses a snapshot name into its components."""
+    # Example: exp-2026-09-04-a/trial0001/tsdb-snapshots/20260904T160520Z-543178ecef36b42c/
+    parts = snapshot.split("/")
+    return parts[:2]
 
     
 def create_log_database(db_path):
@@ -510,18 +525,7 @@ def append_time_slice(df, earliest_start_time, latest_end_time, time_slice_secon
     df = df.copy()
 
     # Convert start_time to datetime and subtract the minimum start_time to get a timedelta
-    df["start_time_dt"] = pd.to_datetime(df.start_time)
-    # min_start = df.start_time_dt.min()
-    # df.start_time_dt = df.start_time_dt - min_start
-    # min_start = min_start - min_start
-    # print(f"min_start = {min_start}")
-
-    # Calculate the maximum start time
-    # max_start = df.start_time_dt.max()
-
-    # Increment max_start by one time slice
-    # max_start = max_start + pd.Timedelta(seconds=time_slice_seconds)
-    # print(f"max_start = {max_start}")
+    df["start_time_dt"] = pd.to_datetime(df.start_time, format="mixed")
     latest_end_time = latest_end_time + pd.Timedelta(seconds=time_slice_seconds)
 
     # Calculate interval_range from the lowest start time to the highest start time of the dataframe
@@ -882,10 +886,11 @@ def calculate_async_utilization_by_autoscaler(files, run_id, s3_bucket, earliest
     labels = ["idle", "processing"]
     utilization_df = None
     for metric, label in zip(metrics, labels):
+        print(metric, label)
         temp_df = get_merged_range_metric_df(files, run_id, s3_bucket, metric, label)
-        # min_timestamp = temp_df.timestamp.min()
-        # max_timestamp = temp_df.timestamp.max()
-        # temp_df["timestamp"] = pd.to_datetime(temp_df["timestamp"])
+        if temp_df is None or len(temp_df) == 0:
+            print(f"temp_df does not exist for metric: {metric}, label: {label}.")
+            continue
         temp_df["timestamp"] = pd.to_datetime(temp_df["timestamp"], unit="s", utc=True).astype('datetime64[us, UTC]')
 
         
@@ -949,6 +954,34 @@ def get_run_start_and_end_times(files, s3_bucket, run_id):
     return earliest_start, latest_end
 
 
+def get_trial_start_and_end_times(files, s3_bucket, run_id, trial_id):
+    """ Retrieves the earliest benchmark start time and the latest benchmark end time.  
+    Used to determine consistent time slices for merging data by time slice. """
+    
+    earliest_start = datetime.datetime.max.replace(tzinfo=datetime.timezone.utc)
+    latest_end = datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
+    
+    # Iterate file infos
+    for file in files:
+        if "run_details.json" in file["Key"]:
+            # parse the file info for the trial id
+            trial_id_for_run, _ = parse_run_details_file_info(file)
+            if trial_id_for_run != trial_id:
+                continue
+            # get the run details for the trial
+            run_details = get_run_details(s3_bucket, run_id, trial_id, verbose=False)
+            # extract the start and end time
+            start = datetime.datetime.fromisoformat(run_details['status']['startTime'].replace('Z', '+00:00'))
+            end = datetime.datetime.fromisoformat(run_details['status']['endTime'].replace('Z', '+00:00'))
+            # compare to the current earliest start and latest end time
+            earliest_start = min(earliest_start, start)
+            latest_end = max(latest_end, end)
+    
+    return earliest_start, latest_end
+
+
+
+
 def get_asynchronous_metrics(files, run_id, s3_bucket, earliest_start_time, latest_end_time,
     l_max=5, l_target=5, n_min=0, u_target=0.50, gamma=0.50, omega=0.50, time_slice_seconds=15):
     """Calculate the asynchronous metrics for a given run."""
@@ -978,7 +1011,8 @@ def get_asynchronous_metrics(files, run_id, s3_bucket, earliest_start_time, late
     
     # Mege lag_df and utilization on timestamp autoscaler, trial_id, and topic
     lag_df = lag_df.merge(async_utilization, on=["timestamp", "autoscaler", "trial_id", "topic"], suffixes=["_lag", "_utilization"])
-    
+    print("Displaying lag_df")
+    display(lag_df)
     
     # Calculate interval_range from the ealiest to latest start time
     time_slice_index = pd.interval_range(
@@ -1048,3 +1082,1178 @@ def get_asynchronous_metrics(files, run_id, s3_bucket, earliest_start_time, late
         
     
     return lag_df, agg_df
+
+
+def get_tsdb_snapshots(files):
+    """Get the tsdb snapshots from the files."""
+    snapshots = set()
+    for file in files:
+        if match := re.search(r"(^.*tsdb-snapshots/\d{8}T\d{6}Z-[0-9a-f]{16}/)", file["Key"]):
+            snapshots.add(match.group(1))
+    
+    # sort and return as a list
+    return sorted(list(snapshots))
+
+
+def get_tsdb_local_dir(run_id: str, trial_id: str) -> str:
+    # Docker volume binds require an absolute host path. Resolve relative to
+    # the project root (the parent of this file's directory) so the path is
+    # stable regardless of the notebook's current working directory.
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(project_root, "data", "tsdb_snapshot", f"{run_id}-{trial_id}")
+
+
+def tsdb_snapshot_exists(tsdb_local_dir: str):
+    """Check if a local tsdb snapshot exists."""
+    return os.path.isdir(tsdb_local_dir)
+       
+
+def execute_promql_range(
+    base_url: str,
+    query: str,
+    start_time: datetime.datetime,
+    end_time: datetime.datetime,
+    step: str = "15s",
+):
+    """Execute a PromQL range query using datetime objects.
+
+    :param base_url: Prometheus root URL (e.g. 'http://localhost:9090')
+    :param query: PromQL expression string
+    :param start_time: datetime object representing start of range
+    :param end_time: datetime object representing end of range
+    :param step: Resolution step width (e.g., '10s', '1m', '5m')
+    """
+    endpoint = f"{base_url}/api/v1/query_range"
+    params = {
+        "query": query,
+        "start": start_time.timestamp(),  # Converts to float epoch seconds
+        "end": end_time.timestamp(),
+        "step": step,
+    }
+
+    try:
+        response = requests.get(endpoint, params=params, timeout=30)
+        response.raise_for_status()
+    except requests.exceptions.HTTPError as e:
+        try:
+            print("Prometheus Error Detail:", response.json().get("error"))
+        except Exception:
+            print(response.text)
+        raise e    
+    return response.json()
+
+
+def parse_s3_uri(s3_uri: str):
+    """Extract bucket name and prefix from an S3 URI."""
+    parsed = urlparse(s3_uri)
+    if parsed.scheme != "s3" or not parsed.netloc:
+        raise ValueError(f"Invalid S3 URI: {s3_uri}. Expected format: s3://bucket-name/path/to/snapshot")
+    bucket = parsed.netloc
+    prefix = parsed.path.lstrip("/")
+    return bucket, prefix
+
+
+def download_s3_folder(bucket_name: str, prefix: str, local_dir: str):
+    """Download all objects under an S3 prefix preserving directory structure."""
+    s3 = boto3.client("s3")
+    paginator = s3.get_paginator("list_objects_v2")
+
+    print(f"Downloading s3://{bucket_name}/{prefix} to {local_dir}...")
+    for page in paginator.paginate(Bucket=bucket_name, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+            relative_path = os.path.relpath(key, prefix)
+            target_path = os.path.join(local_dir, relative_path)
+
+            if key.endswith("/"):
+                os.makedirs(target_path, exist_ok=True)
+                continue
+
+            os.makedirs(os.path.dirname(target_path), exist_ok=True)
+            s3.download_file(bucket_name, key, target_path)
+
+    # Prometheus container runs as 'nobody' (UID 65534). Ensure full read/write access.
+    for root, dirs, files in os.walk(local_dir):
+        for d in dirs:
+            os.chmod(os.path.join(root, d), 0o777)
+        for f in files:
+            os.chmod(os.path.join(root, f), 0o666)
+    os.chmod(local_dir, 0o777)
+
+
+def wait_for_prometheus(base_url: str, timeout: int = 45):
+    """Poll Prometheus until the ready endpoint responds 200 OK."""
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        try:
+            res = requests.get(f"{base_url}/-/ready", timeout=2)
+            if res.status_code == 200:
+                return
+        except requests.RequestException:
+            pass
+        time.sleep(1)
+    raise TimeoutError("Prometheus failed to become ready within the timeout period.")
+
+
+def execute_promql(base_url: str, query: str):
+    """Execute an instant PromQL query and return JSON response."""
+    endpoint = f"{base_url}/api/v1/query"
+    response = requests.get(endpoint, params={"query": query}, timeout=15)
+    response.raise_for_status()
+    return response.json()
+
+
+def run_snapshot_analysis(s3_uri: str, queries: list[str], port: int = 9090):
+    client = docker.from_env()
+    temp_dir = tempfile.mkdtemp(prefix="prom_tsdb_")
+    container = None
+    base_url = f"http://localhost:{port}"
+
+    try:
+        bucket, prefix = parse_s3_uri(s3_uri)
+        download_s3_folder(bucket, prefix, temp_dir)
+
+        print("Starting Prometheus container...")
+        container = client.containers.run(
+            image="prom/prometheus:latest",
+            command=[
+                "--storage.tsdb.path=/prometheus",
+                "--web.enable-lifecycle",
+                "--storage.tsdb.retention.time=100y",
+            ],
+            volumes={
+                temp_dir: {"bind": "/prometheus", "mode": "rw"}
+            },
+            ports={"9090/tcp": port},
+            detach=True,
+            remove=False,
+        )
+
+        wait_for_prometheus(base_url)
+
+        print("\n--- Query Results ---")
+        for q in queries:
+            print(f"\nQuery: {q}")
+            try:
+                result = execute_promql(base_url, q)
+                data = result.get("data", {}).get("result", [])
+                print(f"Returned {len(data)} series/results:")
+                for item in data:
+                    print(item)
+            except Exception as err:
+                print(f"Query execution failed: {err}")
+
+    finally:
+        if container:
+            print("\nStopping and removing container...")
+            try:
+                container.stop(timeout=5)
+                container.remove(v=True)
+            except Exception as e:
+                print(f"Error removing container: {e}")
+
+        if os.path.exists(temp_dir):
+            print(f"Cleaning up temporary data directory: {temp_dir}")
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def get_metric_from_tsdb(s3_bucket, files, query, client, port, step="15s"):
+    """Execute a PromQL query against the tsdb snapshots."""
+    base_url = f"http://localhost:{port}"
+
+    # Get a list of snapshot files from the full list of files
+    snapshots = get_tsdb_snapshots(files)
+
+    # Initialize the dataframe
+    df = None
+
+    # For each snapshot, download the files, start a container, execute the query, and stop the container
+    for snapshot in sorted(snapshots):
+        # Parse the snapshot name to get the run_id and trial_id
+        run_id, trial_id = parse_snapshot_name(snapshot)
+
+        # Get the local directory for the tsdb snapshot
+        tsdb_local_dir = get_tsdb_local_dir(run_id, trial_id)
+
+        # Download the snapshot if it doesn't already exist locally
+        if not tsdb_snapshot_exists(tsdb_local_dir):
+            print(f"Downloading {snapshot}...")
+            download_s3_folder(s3_bucket, snapshot, tsdb_local_dir )
+        
+        # Prometheus requires a config file even when only serving historical
+        # TSDB data for queries. Write a minimal empty config into the bind dir.
+        config_path = os.path.join(tsdb_local_dir, "prometheus.yml")
+        if not os.path.exists(config_path):
+            with open(config_path, "w") as f:
+                f.write("global: {}\n")
+
+        # Start the container
+        container = client.containers.run(
+            image="prom/prometheus:latest",
+            command=[
+                "--config.file=/prometheus/prometheus.yml",
+                "--storage.tsdb.path=/prometheus",
+                "--web.enable-lifecycle",
+                "--storage.tsdb.retention.time=100y",
+            ],
+            volumes={
+                tsdb_local_dir: {"bind": "/prometheus", "mode": "rw"}
+            },
+            ports={"9090/tcp": port},
+            detach=True,
+            remove=True,
+        )
+
+        # Wait for the container to be ready
+        wait_for_prometheus(base_url)
+
+        # Get the start and end times for the range query
+        start_time, end_time = get_trial_start_and_end_times(files, s3_bucket, run_id, trial_id)
+        
+        # Execute the query
+        try:
+            result = execute_promql_range(base_url, query, start_time, end_time)
+            data = result.get("data", {}).get("result", [])
+            # print("Data: ", data)
+        except Exception as err:
+            raise Exception(f"Query execution failed: {err}")
+
+        # Stop the container (will automatically delete)
+        container.stop()
+        
+        # Convert to a dataframe with the result
+        temp_df = MetricRangeDataFrame(data)
+
+        # Add the run_id and trial_id to the dataframe
+        temp_df["run_id"] = run_id  
+        temp_df["trial_id"] = trial_id  
+
+        # Get the run details
+        run_details = get_run_details(s3_bucket, run_id, trial_id)
+
+        # Get the autoscaler
+        autoscaler = get_autoscaler(run_details)
+
+        # Add the autoscaler to the dataframe
+        temp_df["autoscaler"] = autoscaler
+
+
+        # --- Normalize timescale to 0 ---
+        
+        min_ts = temp_df.index.min()
+        temp_df["elapsed_seconds"] = (temp_df.index - min_ts).total_seconds()
+    
+        # Concatenate the dataframe with the result
+        if df is None:
+            df = temp_df
+        else:
+            df = pd.concat([df, temp_df])
+    
+    return df
+
+
+
+
+def plot_trial_timeseries_binned(
+    df,
+    *,
+    node=None,
+    bin_seconds=30,
+    confidence=0.95,
+    figsize=(10, 5.5),
+    xlabel="Elapsed Time (minutes)",
+    ylabel="Value",
+    title=None,
+    trial_alpha=0.18,
+    trial_linewidth=0.8,
+    mean_linewidth=2.0,
+    ci_alpha=0.20,
+    show_trials=True,
+):
+    """
+    Plot binned trial-level time series, across-trial mean, and
+    Student's t confidence interval.
+
+    Each (run_id, trial_id) combination is treated as an independent
+    experimental replicate.
+
+    Raw observations are first assigned to fixed-width elapsed-time
+    bins. Multiple observations within the same trial/bin are averaged
+    before calculating across-trial statistics. Thus, each trial
+    contributes at most one observation to each time bin.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        Must contain:
+            node, value, run_id, trial_id, elapsed_seconds
+
+    node : str, optional
+        Restrict the plot to a single node.
+
+    bin_seconds : int or float
+        Width of elapsed-time bins in seconds.
+
+    confidence : float
+        Confidence level for the Student's t interval.
+
+    figsize : tuple
+        Matplotlib figure size.
+
+    xlabel, ylabel, title : str
+        Plot labels.
+
+    trial_alpha : float
+        Transparency of individual trial trajectories.
+
+    trial_linewidth : float
+        Width of individual trial lines.
+
+    mean_linewidth : float
+        Width of the across-trial mean line.
+
+    ci_alpha : float
+        Transparency of the confidence interval.
+
+    show_trials : bool
+        Whether to show individual trial trajectories.
+
+    Returns
+    -------
+    fig, ax, summary, trial_data
+        Matplotlib figure and axes, across-trial summary statistics,
+        and the binned trial-level data.
+    """
+
+    required = {
+        "node",
+        "value",
+        "run_id",
+        "trial_id",
+        "elapsed_seconds",
+    }
+
+    missing = required - set(df.columns)
+
+    if missing:
+        raise ValueError(
+            f"Dataframe is missing required columns: {sorted(missing)}"
+        )
+
+    if bin_seconds <= 0:
+        raise ValueError("bin_seconds must be greater than zero.")
+
+    if not 0 < confidence < 1:
+        raise ValueError("confidence must be between 0 and 1.")
+
+    # --------------------------------------------------------------
+    # Prepare data
+    # --------------------------------------------------------------
+
+    data = df.copy()
+
+    if node is not None:
+        data = data[data["node"] == node].copy()
+
+    data = data.dropna(
+        subset=["value", "elapsed_seconds", "run_id", "trial_id"]
+    )
+
+    if data.empty:
+        raise ValueError("No observations remain after filtering.")
+
+    # Unique experimental replicate.
+    #
+    # Using both fields prevents trial_id values from separate runs
+    # from accidentally being treated as the same trial.
+    data["trial_key"] = (
+        data["run_id"].astype(str)
+        + "-"
+        + data["trial_id"].astype(str)
+    )
+
+    # --------------------------------------------------------------
+    # Assign observations to fixed-width elapsed-time bins
+    # --------------------------------------------------------------
+    #
+    # Example for bin_seconds=30:
+    #
+    #   0 <= t < 30   -> bin 0
+    #  30 <= t < 60   -> bin 1
+    #  60 <= t < 90   -> bin 2
+    #
+    # We plot each bin at its midpoint:
+    #
+    # 15, 45, 75, ...
+    #
+
+    data["time_bin"] = np.floor(
+        data["elapsed_seconds"] / bin_seconds
+    ).astype(int)
+
+    data["bin_start_seconds"] = (
+        data["time_bin"] * bin_seconds
+    )
+
+    data["bin_midpoint_seconds"] = (
+        data["bin_start_seconds"] + bin_seconds / 2
+    )
+
+    # --------------------------------------------------------------
+    # Stage 1:
+    # Aggregate observations WITHIN each trial/bin
+    # --------------------------------------------------------------
+    #
+    # This is important statistically. A trial containing more raw
+    # samples within a bin should not receive more weight than another
+    # trial.
+    #
+
+    trial_data = (
+        data
+        .groupby(
+            [
+                "trial_key",
+                "time_bin",
+                "bin_start_seconds",
+                "bin_midpoint_seconds",
+            ],
+            as_index=False,
+        )
+        .agg(
+            value=("value", "mean"),
+            observations=("value", "size"),
+        )
+        .sort_values(
+            ["trial_key", "time_bin"]
+        )
+    )
+
+    trial_data["elapsed_minutes"] = (
+        trial_data["bin_midpoint_seconds"] / 60.0
+    )
+
+    # --------------------------------------------------------------
+    # Stage 2:
+    # Calculate statistics ACROSS trials for each bin
+    # --------------------------------------------------------------
+
+    summary = (
+        trial_data
+        .groupby(
+            [
+                "time_bin",
+                "bin_start_seconds",
+                "bin_midpoint_seconds",
+            ],
+            as_index=False,
+        )
+        .agg(
+            mean=("value", "mean"),
+            std=("value", "std"),
+            n=("value", "count"),
+        )
+        .sort_values("time_bin")
+    )
+
+    summary["elapsed_minutes"] = (
+        summary["bin_midpoint_seconds"] / 60.0
+    )
+
+    # Standard error across experimental replicates
+    summary["se"] = (
+        summary["std"] / np.sqrt(summary["n"])
+    )
+
+    # Student's t critical value.
+    #
+    # n can differ between bins if a trial has missing data.
+    summary["t_critical"] = stats.t.ppf(
+        (1 + confidence) / 2,
+        df=summary["n"] - 1,
+    )
+
+    # Confidence interval half-width
+    summary["ci_half_width"] = (
+        summary["t_critical"] * summary["se"]
+    )
+
+    summary["ci_lower"] = (
+        summary["mean"] - summary["ci_half_width"]
+    )
+
+    summary["ci_upper"] = (
+        summary["mean"] + summary["ci_half_width"]
+    )
+
+    # A confidence interval cannot be estimated from a single trial.
+    summary.loc[
+        summary["n"] < 2,
+        ["ci_lower", "ci_upper"]
+    ] = np.nan
+
+    # --------------------------------------------------------------
+    # Plot
+    # --------------------------------------------------------------
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+    # Individual trial trajectories
+    if show_trials:
+        for _, trial in trial_data.groupby("trial_key"):
+
+            ax.plot(
+                trial["elapsed_minutes"],
+                trial["value"],
+                color="0.65",
+                alpha=trial_alpha,
+                linewidth=trial_linewidth,
+                zorder=1,
+            )
+
+    # Student's t confidence interval
+    ax.fill_between(
+        summary["elapsed_minutes"],
+        summary["ci_lower"],
+        summary["ci_upper"],
+        color="0.25",
+        alpha=ci_alpha,
+        linewidth=0,
+        label=f"{confidence:.0%} CI",
+        zorder=2,
+    )
+
+    # Across-trial mean
+    ax.plot(
+        summary["elapsed_minutes"],
+        summary["mean"],
+        color="0.10",
+        linewidth=mean_linewidth,
+        label="Mean",
+        zorder=3,
+    )
+
+    # --------------------------------------------------------------
+    # Dissertation-style formatting
+    # --------------------------------------------------------------
+
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+
+    if title is not None:
+        ax.set_title(title)
+
+    # Horizontal reference grid only
+    ax.grid(
+        axis="y",
+        linestyle="--",
+        linewidth=0.5,
+        alpha=0.35,
+    )
+
+    ax.grid(axis="x", visible=False)
+
+    # Remove unnecessary borders
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+    ax.legend(
+        frameon=False,
+        loc="best",
+    )
+
+    ax.margins(x=0)
+
+    fig.tight_layout()
+
+    return fig, ax, summary, trial_data
+
+
+# import numpy as np
+# import pandas as pd
+# import matplotlib.pyplot as plt
+# from scipy import stats
+
+
+def plot_cpu_allocation(
+    df,
+    bin_seconds=60,
+    saturation_threshold=0.95,
+    autoscaler_order=("none", "hpa", "vpa", "keda"),
+    figsize=None,
+):
+    """
+    Plot node CPU allocation pressure over elapsed benchmark time.
+
+    For each trial:
+      1. Bin observations by elapsed time.
+      2. Compute the mean allocation ratio for each node within each bin.
+      3. Take the maximum across nodes for each trial/bin.
+
+    Across trials:
+      - plot each trial as a light line
+      - plot the mean as a dark line
+      - plot a 95% Student's-t confidence interval around the mean
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        Required columns:
+            node
+            value
+            run_id
+            trial_id
+            autoscaler
+            elapsed_seconds
+
+        value is expected to be:
+            requested CPU / allocatable CPU
+
+        expressed as a ratio (e.g., 0.95 = 95%).
+
+    bin_seconds : int
+        Width of elapsed-time bins.
+
+    saturation_threshold : float
+        Ratio used to indicate severe CPU allocation pressure.
+
+    autoscaler_order : iterable
+        Desired ordering of autoscaler panels.
+
+    figsize : tuple or None
+        Figure size. If None, determined automatically.
+
+    Returns
+    -------
+    fig, axes, trial_binned, summary
+    """
+
+    data = df.copy()
+
+    # ------------------------------------------------------------------
+    # 1. Basic cleanup
+    # ------------------------------------------------------------------
+
+    required = {
+        "node",
+        "value",
+        "run_id",
+        "trial_id",
+        "autoscaler",
+        "elapsed_seconds",
+    }
+
+    missing = required - set(data.columns)
+    if missing:
+        raise ValueError(f"Missing required columns: {sorted(missing)}")
+
+    data["value"] = pd.to_numeric(data["value"], errors="coerce")
+    data["elapsed_seconds"] = pd.to_numeric(
+        data["elapsed_seconds"], errors="coerce"
+    )
+
+    data = data.dropna(
+        subset=["value", "elapsed_seconds", "autoscaler", "trial_id", "node"]
+    )
+
+    # Unique trial identifier in case trial_id is reused across runs.
+    data["trial"] = (
+        data["run_id"].astype(str)
+        + "/"
+        + data["trial_id"].astype(str)
+    )
+
+    # ------------------------------------------------------------------
+    # 2. Bin elapsed time
+    # ------------------------------------------------------------------
+
+    # Use the bin midpoint for plotting.
+    data["time_bin"] = (
+        np.floor(data["elapsed_seconds"] / bin_seconds) * bin_seconds
+        + bin_seconds / 2
+    )
+
+    # Mean within node × trial × time bin.
+    node_binned = (
+        data.groupby(
+            ["autoscaler", "trial", "node", "time_bin"],
+            observed=True,
+            as_index=False,
+        )
+        .agg(allocation_ratio=("value", "mean"))
+    )
+
+    # ------------------------------------------------------------------
+    # 3. Maximum node allocation within each trial/time bin
+    # ------------------------------------------------------------------
+
+    trial_binned = (
+        node_binned.groupby(
+            ["autoscaler", "trial", "time_bin"],
+            observed=True,
+            as_index=False,
+        )
+        .agg(allocation_ratio=("allocation_ratio", "max"))
+    )
+
+    # ------------------------------------------------------------------
+    # 4. Across-trial mean and Student's-t 95% CI
+    # ------------------------------------------------------------------
+
+    summary = (
+        trial_binned.groupby(
+            ["autoscaler", "time_bin"],
+            observed=True,
+        )["allocation_ratio"]
+        .agg(["mean", "std", "count"])
+        .reset_index()
+    )
+
+    summary["se"] = summary["std"] / np.sqrt(summary["count"])
+
+    summary["t_crit"] = stats.t.ppf(
+        0.975,
+        df=summary["count"] - 1,
+    )
+
+    # CI is undefined for n < 2.
+    summary.loc[summary["count"] < 2, "t_crit"] = np.nan
+
+    summary["ci"] = summary["t_crit"] * summary["se"]
+    summary["ci_low"] = summary["mean"] - summary["ci"]
+    summary["ci_high"] = summary["mean"] + summary["ci"]
+
+    # ------------------------------------------------------------------
+    # 5. Determine autoscaler panels
+    # ------------------------------------------------------------------
+
+    present = set(trial_binned["autoscaler"].unique())
+
+    autoscalers = [
+        a for a in autoscaler_order
+        if a in present
+    ]
+
+    # Include unexpected autoscaler names at the end.
+    autoscalers += sorted(present - set(autoscalers))
+
+    n = len(autoscalers)
+
+    if figsize is None:
+        figsize = (7.0, 2.3 * n)
+
+    fig, axes = plt.subplots(
+        nrows=n,
+        ncols=1,
+        figsize=figsize,
+        sharex=True,
+        sharey=True,
+        constrained_layout=True,
+    )
+
+    if n == 1:
+        axes = np.array([axes])
+
+    # ------------------------------------------------------------------
+    # 6. Plot
+    # ------------------------------------------------------------------
+
+    for ax, autoscaler in zip(axes, autoscalers):
+
+        trials = trial_binned[
+            trial_binned["autoscaler"] == autoscaler
+        ]
+
+        agg = summary[
+            summary["autoscaler"] == autoscaler
+        ]
+
+        # Individual trials
+        for _, trial in trials.groupby("trial", observed=True):
+            trial = trial.sort_values("time_bin")
+
+            ax.plot(
+                trial["time_bin"] / 60,
+                trial["allocation_ratio"] * 100,
+                linewidth=0.7,
+                alpha=0.20,
+            )
+
+        # 95% Student's-t CI
+        ax.fill_between(
+            agg["time_bin"] / 60,
+            agg["ci_low"] * 100,
+            agg["ci_high"] * 100,
+            alpha=0.18,
+            linewidth=0,
+        )
+
+        # Across-trial mean
+        ax.plot(
+            agg["time_bin"] / 60,
+            agg["mean"] * 100,
+            linewidth=2.0,
+            label="Mean",
+        )
+
+        # Saturation threshold
+        ax.axhline(
+            saturation_threshold * 100,
+            linestyle="--",
+            linewidth=1.0,
+        )
+
+        # 100% allocatable capacity
+        ax.axhline(
+            100,
+            linestyle=":",
+            linewidth=1.0,
+        )
+
+        ax.set_title(
+            autoscaler.upper() if autoscaler != "none" else "No autoscaler",
+            loc="left",
+            fontweight="bold",
+        )
+
+        ax.set_ylabel("CPU allocation (%)")
+
+        ax.grid(
+            axis="y",
+            alpha=0.20,
+            linewidth=0.6,
+        )
+
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+
+    axes[-1].set_xlabel("Elapsed time (minutes)")
+
+    fig.suptitle(
+        "Maximum Node CPU Request Saturation by Autoscaler",
+        fontweight="bold",
+    )
+
+    return fig, axes, trial_binned, summary
+
+# import numpy as np
+# import pandas as pd
+# import matplotlib.pyplot as plt
+# from scipy import stats
+
+
+def plot_cpu_saturation_time_share(
+    df,
+    threshold=0.95,
+    autoscaler_order=("none", "hpa", "vpa", "keda"),
+    figsize=(7, 5),
+    jitter=0.08,
+):
+    """
+    Plot trial-level percentage of time under severe CPU request saturation.
+
+    CPU request saturation at time t is defined as:
+
+        max_n(
+            requested_cpu_n(t) / allocatable_cpu_n(t)
+        )
+
+    A trial is considered saturated at time t when this value is >= threshold.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        Required columns:
+            node
+            value
+            run_id
+            trial_id
+            autoscaler
+            elapsed_seconds
+
+        `value` is expected to be:
+            requested CPU / allocatable CPU
+
+    threshold : float
+        CPU request saturation threshold.
+        Default = 0.95 (95%).
+
+    autoscaler_order : iterable
+        Desired ordering of autoscaler categories.
+
+    figsize : tuple
+        Figure dimensions.
+
+    jitter : float
+        Horizontal jitter applied to trial observations.
+
+    Returns
+    -------
+    fig, ax, trial_summary, autoscaler_summary
+    """
+
+    data = df.copy()
+
+    required = {
+        "node",
+        "value",
+        "run_id",
+        "trial_id",
+        "autoscaler",
+        "elapsed_seconds",
+    }
+
+    missing = required - set(data.columns)
+
+    if missing:
+        raise ValueError(
+            f"Missing required columns: {sorted(missing)}"
+        )
+
+    data["value"] = pd.to_numeric(
+        data["value"],
+        errors="coerce",
+    )
+
+    data["elapsed_seconds"] = pd.to_numeric(
+        data["elapsed_seconds"],
+        errors="coerce",
+    )
+
+    data = data.dropna(
+        subset=[
+            "node",
+            "value",
+            "run_id",
+            "trial_id",
+            "autoscaler",
+            "elapsed_seconds",
+        ]
+    )
+
+    # --------------------------------------------------------------
+    # 1. Maximum node CPU request saturation at each observation
+    # --------------------------------------------------------------
+
+    instantaneous = (
+        data.groupby(
+            [
+                "run_id",
+                "trial_id",
+                "autoscaler",
+                "elapsed_seconds",
+            ],
+            observed=True,
+            as_index=False,
+        )
+        .agg(
+            max_cpu_request_ratio=("value", "max")
+        )
+    )
+
+    instantaneous["saturated"] = (
+        instantaneous["max_cpu_request_ratio"] >= threshold
+    )
+
+    # --------------------------------------------------------------
+    # 2. Trial-level saturation time share
+    #
+    # Because observations are regularly spaced, the proportion of
+    # observations satisfying the condition equals the time share.
+    # --------------------------------------------------------------
+
+    trial_summary = (
+        instantaneous.groupby(
+            ["run_id", "trial_id", "autoscaler"],
+            observed=True,
+            as_index=False,
+        )
+        .agg(
+            cpu_saturation_time_share=("saturated", "mean"),
+            max_cpu_request_ratio=("max_cpu_request_ratio", "max"),
+            mean_max_cpu_request_ratio=("max_cpu_request_ratio", "mean"),
+            observations=("saturated", "size"),
+        )
+    )
+
+    trial_summary["cpu_saturation_time_share_pct"] = (
+        trial_summary["cpu_saturation_time_share"] * 100
+    )
+
+    # --------------------------------------------------------------
+    # 3. Autoscaler-level mean and Student's-t 95% CI
+    # --------------------------------------------------------------
+
+    autoscaler_summary = (
+        trial_summary.groupby(
+            "autoscaler",
+            observed=True,
+        )["cpu_saturation_time_share_pct"]
+        .agg(["mean", "std", "count"])
+        .reset_index()
+    )
+
+    autoscaler_summary["se"] = (
+        autoscaler_summary["std"]
+        / np.sqrt(autoscaler_summary["count"])
+    )
+
+    autoscaler_summary["t_crit"] = stats.t.ppf(
+        0.975,
+        df=autoscaler_summary["count"] - 1,
+    )
+
+    autoscaler_summary.loc[
+        autoscaler_summary["count"] < 2,
+        "t_crit",
+    ] = np.nan
+
+    autoscaler_summary["ci"] = (
+        autoscaler_summary["t_crit"]
+        * autoscaler_summary["se"]
+    )
+
+    autoscaler_summary["ci_low"] = (
+        autoscaler_summary["mean"]
+        - autoscaler_summary["ci"]
+    )
+
+    autoscaler_summary["ci_high"] = (
+        autoscaler_summary["mean"]
+        + autoscaler_summary["ci"]
+    )
+
+    # Percentages cannot extend outside [0, 100].
+    autoscaler_summary["ci_low"] = (
+        autoscaler_summary["ci_low"].clip(lower=0)
+    )
+
+    autoscaler_summary["ci_high"] = (
+        autoscaler_summary["ci_high"].clip(upper=100)
+    )
+
+    # --------------------------------------------------------------
+    # 4. Determine plotting order
+    # --------------------------------------------------------------
+
+    present = set(trial_summary["autoscaler"].unique())
+
+    autoscalers = [
+        a for a in autoscaler_order
+        if a in present
+    ]
+
+    autoscalers += sorted(
+        present - set(autoscalers)
+    )
+
+    x_positions = np.arange(len(autoscalers))
+
+    # --------------------------------------------------------------
+    # 5. Plot
+    # --------------------------------------------------------------
+
+    fig, ax = plt.subplots(
+        figsize=figsize,
+        constrained_layout=True,
+    )
+
+    # Deterministic jitter so the figure is reproducible.
+    rng = np.random.default_rng(42)
+
+    for x, autoscaler in zip(x_positions, autoscalers):
+
+        trials = trial_summary[
+            trial_summary["autoscaler"] == autoscaler
+        ]
+
+        summary = autoscaler_summary[
+            autoscaler_summary["autoscaler"] == autoscaler
+        ].iloc[0]
+
+        # Individual trials
+        x_jittered = (
+            x
+            + rng.uniform(
+                -jitter,
+                jitter,
+                size=len(trials),
+            )
+        )
+
+        ax.scatter(
+            x_jittered,
+            trials["cpu_saturation_time_share_pct"],
+            s=35,
+            alpha=0.45,
+            zorder=2,
+            label=None,
+        )
+
+        # Mean
+        ax.scatter(
+            x,
+            summary["mean"],
+            s=90,
+            marker="D",
+            edgecolor="black",
+            linewidth=0.8,
+            zorder=4,
+        )
+
+        # 95% Student's-t CI
+        if np.isfinite(summary["ci"]):
+            ax.errorbar(
+                x,
+                summary["mean"],
+                yerr=[
+                    [summary["mean"] - summary["ci_low"]],
+                    [summary["ci_high"] - summary["mean"]],
+                ],
+                fmt="none",
+                capsize=5,
+                linewidth=1.5,
+                zorder=3,
+            )
+
+    # --------------------------------------------------------------
+    # 6. Formatting
+    # --------------------------------------------------------------
+
+    labels = [
+        "No autoscaler" if a == "none" else a.upper()
+        for a in autoscalers
+    ]
+
+    ax.set_xticks(x_positions)
+    ax.set_xticklabels(labels)
+
+    ax.set_ylabel(
+        f"Time at ≥{threshold * 100:.0f}% CPU request saturation (%)"
+    )
+
+    ax.set_xlabel("Autoscaler")
+
+    ax.set_title(
+        f"Trial-Level Time at ≥{threshold * 100:.0f}% "
+        "Maximum Node CPU Request Saturation",
+        fontweight="bold",
+    )
+
+    ax.set_ylim(-2, 102)
+
+    ax.grid(
+        axis="y",
+        alpha=0.20,
+        linewidth=0.6,
+    )
+
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+    return (
+        fig,
+        ax,
+        trial_summary,
+        autoscaler_summary,
+    )

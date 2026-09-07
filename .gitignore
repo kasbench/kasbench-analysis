@@ -224,3 +224,6 @@ __marimo__/
 # Data directory (downloaded results of experiments -- too large for GitHub)
 /data
 
+/figures
+
+.DS_Store
