@@ -77,6 +77,50 @@ def download_locust_db(data_dir, s3_bucket, s3_key, trial, role, filename, force
     return local_file_path
 
 
+def get_experiment_progress(s3_bucket, run_id):
+    """ Get the experiment-progress.json from S3"""
+    key = f"{run_id}/experiment-progress.json"
+    obj = s3.get_object(Bucket=s3_bucket, Key=key)
+    return json.loads(obj['Body'].read())
+
+
+def download_benchmark_db(s3_bucket, run_id, local_file_path):
+    """ Downloads the benchmark database from S3"""
+    # if local_file_path exists, return
+    if os.path.exists(local_file_path):
+        return
+    key = f"{run_id}/benchmark.db"
+    s3.download_file(s3_bucket, key, local_file_path)
+
+
+def get_benchmark_start_end(benchmark_db_path):
+    """Get the start and end time of the benchmark"""
+    conn = sqlite3.connect(benchmark_db_path)
+    cursor = conn.cursor()
+
+    # Get the minimum and maximum timestamps
+    cursor.execute("SELECT MIN(event_time), MAX(event_time) FROM events")
+    start_time, end_time = cursor.fetchone()
+
+    # Convert timestamps to datetime objects with timezone
+    # Note: the timestamps in the database are already in UTC.
+    # start_time and end_time are strings in the form "2026-09-04T15:26:11Z".  
+    
+    end_time = end_time.replace(tzinfo=datetime.timezone.utc)
+    start_time = datetime.datetime.strptime(start_time, "%Y-%m-%dT%H:%M:%SZ")
+    end_time = datetime.datetime.strptime(end_time, "%Y-%m-%dT%H:%M:%SZ")
+    conn.close()
+
+    return start_time, end_time
+
+
+def get_tofu_outputs(s3_bucket, run_id, trial_id):
+    """Get the tofu outputs from S3"""
+    key = f"{run_id}/{trial_id}/infrastructure/tofu_outputs.json"
+    obj = s3.get_object(Bucket=s3_bucket, Key=key)
+    return json.loads(obj['Body'].read())
+
+
 def is_locust_db(file_info):
     """Check if the file info refers to a locust database file"""
     s3_key = file_info["Key"]
@@ -183,6 +227,22 @@ def get_autoscaler(run_details):
 
 def get_trial_summary_df(df):
     """ Computes aggregates for each trial """
+    df = df.copy()
+    df["is_success"] = pd.to_numeric(df["status_code"], errors="coerce").between(200, 299)
+    response_time_summary = ( df[df.is_success].groupby(["autoscaler", "trial_id"], as_index=False)
+        .agg(
+            successful_requests=("status_code", "size"),
+            mean_response_time=("response_time", "mean"),
+        ))
+    failure_rate_summary = ( df.groupby(["autoscaler", "trial_id"], as_index=False)
+        .agg(
+            requests=("status_code", "size"),
+            failures=("failure", "sum"),
+            failure_rate=("failure", "mean"),
+        ))
+    return response_time_summary.merge(failure_rate_summary, on=["autoscaler", "trial_id"], how="outer")
+
+
     return (
         df.groupby(["autoscaler", "trial_id"], as_index=False)
         .agg(
@@ -586,6 +646,7 @@ def calculate_tau_metrics(
     time_slice_col: str = "time_slice",
     response_time_col: str = "response_time",
     failure_col: str = "failure",
+    tolerance: float = 0.20
 ) -> TauResults:
     """
     Calculate all four tau time-share metrics:
@@ -726,22 +787,22 @@ def calculate_tau_metrics(
 
     # Equivalent to max(sgn(RT_t - SLO_RT), 0).
     time_slices["indicator_u_rt"] = (
-        time_slices["mean_response_time_ms"] > slo_rt_ms
+        time_slices["mean_response_time_ms"] > (slo_rt_ms * (1.0 + tolerance))
     ).astype(np.int8)
 
     # Equivalent to max(sgn(SLO_RT - RT_t), 0).
     time_slices["indicator_o_rt"] = (
-        time_slices["mean_response_time_ms"] < slo_rt_ms
+        time_slices["mean_response_time_ms"] < (slo_rt_ms * (1.0 - tolerance))
     ).astype(np.int8)
 
     # Equivalent to max(sgn(FR_t - SLO_FR), 0).
     time_slices["indicator_u_fr"] = (
-        time_slices["failure_rate"] > slo_fr
+        time_slices["failure_rate"] > (slo_fr * (1.0 + tolerance))
     ).astype(np.int8)
 
     # Equivalent to max(sgn(SLO_FR - FR_t), 0).
     time_slices["indicator_o_fr"] = (
-        time_slices["failure_rate"] < slo_fr
+        time_slices["failure_rate"] < (slo_fr * (1.0 - tolerance))
     ).astype(np.int8)
 
     trial_group_columns = [
@@ -821,6 +882,9 @@ def parse_metric_file_info(file_info):
 def get_merged_range_metric_df(files, run_id, s3_bucket, metric, column_label):
         
     metrics_df = None
+
+    if files is None:
+        files = get_s3_file_listing(s3_bucket, run_id)
 
     for file in files:
         # select the metrics file to process
@@ -2811,3 +2875,74 @@ def plot_cpu_reservation_gap(
     ax.spines["right"].set_visible(False)
 
     return fig, ax, trial_summary, summary
+
+
+def download_locust_dbs(s3_bucket, run_id, data_directory):
+    local_db_paths = []
+
+    # Get the file listing
+    files = get_s3_file_listing(s3_bucket, s3_prefix=run_id)
+
+    # Iterate through the files and download the locust databases
+    for file_info in files:
+        # skip non-database files
+        if not is_locust_db(file_info):
+            continue
+        
+        # parse trial, role, and filename from the S3 file info
+        trial, role, filename = parse_locust_db_file_info(file_info)
+
+
+        # skip if it-operations.  It operations transactions are not tracked for response time/failure rate
+        if role == "it-operations":
+            continue
+        
+        # download the database if it doesn't already exist
+        local_db_path = download_locust_db(data_directory, s3_bucket, file_info["Key"], trial, role, filename)
+        
+        local_db_paths.append(local_db_path)
+
+    return local_db_paths
+
+
+def create_run_db(run_id, run_db_path, s3_bucket, local_db_paths):
+    # Delete the log database if it already exists
+    if os.path.exists(run_db_path):
+        os.remove(run_db_path)
+
+    # Create the log database
+    create_log_database(run_db_path)
+
+    # Populate the log database from the locust database files
+    for local_db_path in local_db_paths:
+        
+        # User regex to parse trial and role from '../data/calibration-15-percentile-a/trial0001/db/back-office/back-office.db'
+        match = re.match(r'.*/([^/]+)/db/(.*)/(.*\.db)', local_db_path)
+        trial_id = match.group(1)
+        role = match.group(2)   
+        # print(f"{local_db_path} - {trial_id} - {role}")
+
+        # skip if it-operations.  It operations transactions are not tracked for response time/failure rate
+        if role == "it-operations":
+            continue
+
+        # get the autoscaler from the run details
+        run_details = get_run_details(s3_bucket, run_id, trial_id)
+        autoscaler = get_autoscaler(run_details)
+        
+        # load as a dataframe, augmented with run id, trial id, and role
+        df = get_raw_log_as_dataframe(local_db_path)
+        df["run_id" ] = run_id
+        df["trial_id" ] = trial_id
+        df["role" ] = role
+        df["autoscaler" ] = autoscaler
+        df["success"] = (
+            pd.to_numeric(df["status_code"], errors="coerce")
+            .between(200, 299)
+            )
+        df["failure"] = ~df["success"]
+
+        # append to the sqlite database
+        df.to_sql('logs', sqlite3.connect(run_db_path), if_exists='append', index=False)
+        
+
