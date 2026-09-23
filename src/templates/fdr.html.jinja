@@ -59,12 +59,30 @@
 
 <h2>Raw Performance Metrics</h2>
 
-<h3>Summarized Performance Metrics by Trial</h3>
+  <h3>Summarized Performance Metrics by Trial</h3>
   <div class="table-wrap">
   {{ merged_trial_summary_table_html | safe }}
   </div>
 
-  
+  <h3>Summarized Performance Metrics by Autoscaler</h3>
+  <div class="table-wrap">
+  {{ autoscaler_summary_table_html | safe }}
+  </div>
+
+  <div class="figure">
+    <img src="{{ response_time_plot_path }}" alt="Response time plot">
+    <p class="fig-caption">Figure 1. Mean response time by autoscaler.</p>
+  </div>
+ 
+  <div class="figure">
+    <img src="{{ failure_rate_plot_path }}" alt="Response time plot">
+    <p class="fig-caption">Figure 2. Mean failure rate by autoscaler.</p>
+  </div>
+ 
+  <div class="figure">
+    <img src="{{ round_trip_plot_path }}" alt="Response time plot">
+    <p class="fig-caption">Figure 3. Mean round trip percentage by autoscaler.</p>
+  </div>
  
 </body>
 </html>

@@ -3113,51 +3113,215 @@ def download_and_load_locust_dbs(s3_bucket, run_id, run_db, data_dir):
         # append to the sqlite database
         df.to_sql('logs', sqlite3.connect(run_db), if_exists='append', index=False)
         
-def plot_mean_response_time_by_autoscaler(trial_summary_df, show=False):
-    fig, ax = plt.subplots(figsize=(8,5))
 
-    autoscalers = sorted(trial_summary_df["autoscaler"].unique())
 
-    for i, a in enumerate(autoscalers):
-        d = trial_summary_df[trial_summary_df.autoscaler == a]
+def plot_mean_response_time_by_autoscaler(
+    trial_summary: pd.DataFrame,
+    *,
+    autoscaler_order: list[str] | None = None,
+    confidence_level: float = 0.95,
+    random_seed: int = 42,
+    filename: str = "../figures/response_time_by_autoscaler.png",
+    show: bool = False,
+    include_title: bool = False,
+) -> tuple[plt.Figure, plt.Axes, str]:
+    """
+    Plot trial-level mean response times by autoscaler.
 
-        # jittered trial means
-        x = np.random.normal(i, 0.04, len(d))
-        ax.scatter(x, d["mean_response_time"],
-                alpha=0.7, s=40)
+    Each small point represents one trial. The larger point represents the
+    unweighted mean of the trial response times. Error bars show a two-sided
+    Student-t confidence interval for the mean.
 
-        mean = d["mean_response_time"].mean()
-        se = d["mean_response_time"].std(ddof=1) / np.sqrt(len(d))
+    Parameters
+    ----------
+    trial_summary:
+        DataFrame containing:
+          - autoscaler
+          - trial_id
+          - mean_response_time
+
+    autoscaler_order:
+        Optional display order. Autoscalers not listed here are appended
+        alphabetically.
+
+    confidence_level:
+        Confidence level for the error bars. Default is 0.95.
+
+    random_seed:
+        Seed used to make horizontal point jitter reproducible.
+
+    filename:
+        Destination path for the saved figure.
+
+    show:
+        Whether to display the plot interactively.
+
+    include_title:
+        Whether to render the axis title.
+
+    Returns
+    -------
+    tuple[matplotlib.figure.Figure, matplotlib.axes.Axes, str]
+        The generated figure, axes, and saved file path.
+    """
+    if autoscaler_order is None:
+        autoscaler_order = ["none", "hpa", "vpa", "keda"]
+
+    required_columns = {"autoscaler", "trial_id", "mean_response_time"}
+    missing_columns = required_columns - set(trial_summary.columns)
+
+    if missing_columns:
+        raise ValueError(
+            f"trial_summary is missing required columns: "
+            f"{sorted(missing_columns)}"
+        )
+
+    if not 0 < confidence_level < 1:
+        raise ValueError("confidence_level must be between 0 and 1.")
+
+    plot_df = trial_summary[
+        ["autoscaler", "trial_id", "mean_response_time"]
+    ].copy()
+
+    plot_df["mean_response_time"] = pd.to_numeric(
+        plot_df["mean_response_time"],
+        errors="coerce",
+    )
+
+    if plot_df["mean_response_time"].isna().any():
+        bad_rows = plot_df.loc[plot_df["mean_response_time"].isna()]
+        raise ValueError(
+            "mean_response_time contains missing or nonnumeric values. "
+            f"Invalid rows:\n{bad_rows}"
+        )
+
+    present_autoscalers = sorted(plot_df["autoscaler"].dropna().unique())
+
+    if autoscaler_order is None:
+        autoscalers = present_autoscalers
+    else:
+        autoscalers = [
+            autoscaler
+            for autoscaler in autoscaler_order
+            if autoscaler in present_autoscalers
+        ]
+        autoscalers.extend(
+            autoscaler
+            for autoscaler in present_autoscalers
+            if autoscaler not in autoscalers
+        )
+
+    rng = np.random.default_rng(random_seed)
+
+    fig, ax = plt.subplots(figsize=(8, 5.5))
+
+    alpha = 1 - confidence_level
+    summary_rows = []
+
+    for position, autoscaler in enumerate(autoscalers):
+        autoscaler_df = plot_df.loc[plot_df["autoscaler"] == autoscaler]
+        response_times = autoscaler_df["mean_response_time"].to_numpy()
+
+        # Reproducible horizontal jitter so overlapping trial points remain visible
+        jittered_x = rng.normal(
+            loc=position,
+            scale=0.045,
+            size=len(response_times),
+        )
+
+        ax.scatter(
+            jittered_x,
+            response_times,
+            s=45,
+            alpha=0.65,
+            label="Individual trial" if position == 0 else None,
+            zorder=2,
+        )
+
+        number_of_trials = len(response_times)
+        mean_rt = response_times.mean()
+
+        if number_of_trials >= 2:
+            standard_deviation = response_times.std(ddof=1)
+            standard_error = standard_deviation / np.sqrt(number_of_trials)
+            critical_value = t.ppf(
+                1 - alpha / 2,
+                df=number_of_trials - 1,
+            )
+            confidence_interval_half_width = critical_value * standard_error
+        else:
+            standard_deviation = np.nan
+            standard_error = np.nan
+            confidence_interval_half_width = np.nan
 
         ax.errorbar(
-            i,
-            mean,
-            yerr=1.96 * se,
+            position,
+            mean_rt,
+            yerr=confidence_interval_half_width,
             fmt="o",
-            capsize=6,
-            markersize=8,
+            markersize=9,
+            capsize=7,
+            capthick=1.5,
             linewidth=2,
+            label=(
+                f"Mean and {confidence_level:.0%} CI"
+                if position == 0
+                else None
+            ),
+            zorder=3,
+        )
+
+        summary_rows.append(
+            {
+                "autoscaler": autoscaler,
+                "trials": number_of_trials,
+                "mean_response_time": mean_rt,
+                "sd_response_time": standard_deviation,
+                "se_response_time": standard_error,
+                "ci_lower": (
+                    max(0, mean_rt - confidence_interval_half_width)
+                    if number_of_trials >= 2
+                    else np.nan
+                ),
+                "ci_upper": (
+                    mean_rt + confidence_interval_half_width
+                    if number_of_trials >= 2
+                    else np.nan
+                ),
+            }
         )
 
     ax.set_xticks(range(len(autoscalers)))
-    ax.set_xticklabels(
-        [autoscaler.upper() for autoscaler in autoscalers]
-    )
-    ax.set_ylabel("Mean response time (ms)")
+    ax.set_xticklabels([autoscaler.upper() for autoscaler in autoscalers])
+
     ax.set_xlabel("Autoscaler")
+    ax.set_ylabel("Mean response time (ms)")
+    if include_title:
+        ax.set_title(
+            "Mean Response Time by Autoscaler\n"
+            "Trial-level means with overall mean and "
+            f"{confidence_level:.0%} confidence interval"
+        )
 
-    plt.tight_layout()
+    ax.set_ylim(bottom=0)
+    ax.grid(axis="y", alpha=0.25)
+    ax.legend()
 
-    fig.savefig(
-        "../figures/response_time_by_autoscaler.png",
-        dpi=300,
-        bbox_inches="tight",
-    )
+    fig.tight_layout()
+
+    ax.response_time_summary = pd.DataFrame(summary_rows)
 
     if show:
         plt.show()
 
-    return fig, ax
+    fig.savefig(
+        filename,
+        dpi=300,
+        bbox_inches="tight",
+    )
+
+    return fig, ax, filename
+
 
 
 def plot_failure_rate_by_autoscaler(
@@ -3166,6 +3330,7 @@ def plot_failure_rate_by_autoscaler(
     autoscaler_order: list[str] | None = None,
     confidence_level: float = 0.95,
     random_seed: int = 42,
+    filename: str = "../figures/failure_rate_by_autoscaler.png",
     show: bool = False,
     include_title: bool = False,
 ) -> tuple[plt.Figure, plt.Axes]:
@@ -3389,12 +3554,12 @@ def plot_failure_rate_by_autoscaler(
         plt.show()
     
     fig.savefig(
-        "../figures/failure_rate_by_autoscaler.png",
+        filename,
         dpi=300,
         bbox_inches="tight",
     )
 
-    return fig, ax
+    return fig, ax, filename
 
 def plot_roundtrip_completion_by_autoscaler(
     trial_summary: pd.DataFrame,
@@ -3402,6 +3567,7 @@ def plot_roundtrip_completion_by_autoscaler(
     autoscaler_order: list[str] | None = None,
     confidence_level: float = 0.95,
     random_seed: int = 42,
+    filename: str = "../figures/roundtrip_completion_by_autoscaler.png",
     show: bool = False,
     include_title: bool = False,
 ) -> tuple[plt.Figure, plt.Axes]:
@@ -3675,12 +3841,12 @@ def plot_roundtrip_completion_by_autoscaler(
         plt.show()
 
     fig.savefig(
-        "../figures/roundtrip_completion_by_autoscaler.png",
+        filename,
         dpi=300,
         bbox_inches="tight",
     )
 
-    return fig, ax
+    return fig, ax, filename
 
 
 def images_to_html(images_df):
@@ -3746,6 +3912,70 @@ def merged_trial_summary_df_to_html(merged_trial_summary_df):
 
     # Sort by Trial ID
     df = df.sort_values(by=["Trial ID"])
+
+    # Format columns (DataFrame level)
+    df["Failure Rate"] = df["Failure Rate"].apply(lambda x: f"{x:.3%}")
+    df["Round-trip Completion (%)"] = df["Round-trip Completion (%)"].apply(
+        lambda x: f"{x:.1f}%"
+    )
+
+    # Initialize Styler
+    style = df.style.format({"Mean Response Time (ms)": "{:.0f}"})
+
+    # Apply properties and styles
+    style = style.set_properties(**{"text-align": "center"})
+    style = style.set_table_styles(
+        [{"selector": "th", "props": [("text-align", "center")]}]
+    )
+
+    # Capitalize the autoscaler column (all caps)
+    style = style.set_properties(
+        subset=["Autoscaler"], **{"text-transform": "uppercase"}
+    )
+
+    # Hide the index on the Styler object
+    style = style.hide(axis="index")
+
+    # Generate the HTML table using Styler.to_html options
+    html = style.to_html(
+        escape=False,
+        encoding="utf-8",  # replacing structural parameters not supported by styler
+    )
+
+    # If you need to inject custom classes or borders into the <table> tag,
+    # it is safest to do it on the final string or via set_table_attributes
+    style = style.set_table_attributes('class="data-table compact" border="0"')
+    html = style.to_html(escape=False)
+
+
+    return html
+
+
+def autoscaler_summary_df_to_html(autoscaler_summary_df):
+    """Returns the merge summary dataframe as a HTML table."""
+    df = autoscaler_summary_df.copy()
+
+    df = df[
+        [
+            "autoscaler",
+            "mean_rt",
+            "mean_failure_rate",
+            "mean_roundtrip_completion_percentage",
+        ]
+    ]
+
+    df.columns = [
+        "Autoscaler",
+        "Mean Response Time (ms)",
+        "Failure Rate",
+        "Round-trip Completion (%)",
+    ]
+
+    # Clean the column axis name BEFORE converting to Styler
+    df.columns.name = None
+
+    # # Sort by Trial ID
+    # df = df.sort_values(by=["Trial ID"])
 
     # Format columns (DataFrame level)
     df["Failure Rate"] = df["Failure Rate"].apply(lambda x: f"{x:.3%}")
