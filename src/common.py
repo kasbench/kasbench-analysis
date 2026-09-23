@@ -12,7 +12,7 @@ import time
 import shutil
 import tempfile
 from urllib.parse import urlparse
-
+import subprocess
 
 
 import boto3
@@ -22,7 +22,6 @@ from scipy.stats import t
 from prometheus_api_client import PrometheusConnect, MetricRangeDataFrame
 import matplotlib.pyplot as plt
 from scipy import stats
-
 
 
 s3 = boto3.client("s3")
@@ -326,9 +325,12 @@ def get_autoscaler_summary(
     return autoscaler_summary
 
 
-def merge_roundtrip_completion_percentage(files, s3_bucket, trial_summary_df):
+def merge_roundtrip_completion_percentage(files, s3_bucket, trial_summary_df, run_id=None):
         
     roundtrip_df = None
+
+    if files is None:
+        files = get_s3_file_listing(s3_bucket, run_id)
 
     for file in files:
         # select the roundtrip json results
@@ -2892,7 +2894,6 @@ def download_locust_dbs(s3_bucket, run_id, data_directory):
         # parse trial, role, and filename from the S3 file info
         trial, role, filename = parse_locust_db_file_info(file_info)
 
-
         # skip if it-operations.  It operations transactions are not tracked for response time/failure rate
         if role == "it-operations":
             continue
@@ -2945,4 +2946,841 @@ def create_run_db(run_id, run_db_path, s3_bucket, local_db_paths):
         # append to the sqlite database
         df.to_sql('logs', sqlite3.connect(run_db_path), if_exists='append', index=False)
         
+
+def get_images(s3_bucket, run_id, trial_id, verbose=False):
+    """Get the run details from S3"""
+    prefixes = ["pre", "post"]
+    images = []
+    for prefix in prefixes:
+        key = f"{run_id}/{trial_id}/images/{prefix}-images.json"
+        obj = s3.get_object(Bucket=s3_bucket, Key=key)
+        image = json.loads(obj['Body'].read())
+        images.append(image)
+    return images
+
+
+def get_start_end_time(s3_bucket, run_id, verbose=False):
+    """Get the run details from S3"""
+    key = f"{run_id}/start_time.txt"
+    obj = s3.get_object(Bucket=s3_bucket, Key=key)
+    start_time = obj['Body'].read()
+    start_time = start_time.decode('utf-8')
+    start_time = start_time.replace("T", " ")
+    start_time = start_time.replace("Z", "")
+    
+    key = f"{run_id}/end_time.txt"
+    obj = s3.get_object(Bucket=s3_bucket, Key=key)
+    end_time = obj['Body'].read()
+    end_time = end_time.decode('utf-8')
+    end_time = end_time.replace("T", " ")
+    end_time = end_time.replace("Z", "")
+    
+    return start_time, end_time
+
+
+def get_benchmark_images_df(s3_bucket, run_id, trial_id, verbose=False):
+    """Get listing of helm charts used in the benchmark"""
+    
+    # Get the environment from S3 and extract the controller image
+    key = f"{run_id}/environment.json"
+    obj = s3.get_object(Bucket=s3_bucket, Key=key)
+    environment = json.loads(obj['Body'].read())
+    controller_image = f"{environment['KASBENCH_IMAGE_NAME']}:{environment['KASBENCH_IMAGE_TAGS']}"
+    controller_image_id = environment["KASBENCH_IMAGE_ID"]
+    controller = {"Image": controller_image, "ImageId": controller_image_id}
+    
+    
+    # Load {run_id}/{trial_id}/kasbench-runner.json from S3
+    key = f"{run_id}/{trial_id}/images/kasbench-runner.json"
+    obj = s3.get_object(Bucket=s3_bucket, Key=key)
+    kasbench_runner_details = json.loads(obj['Body'].read())
+    kasbench_runner_image = kasbench_runner_details["imageName"]
+    kasbench_runner_image_id = kasbench_runner_details["imageId"]
+    kasbench_runner = {"Image": kasbench_runner_image, "ImageId": kasbench_runner_image_id}
+
+    # Load {run_id}/{trial_id}/load_runner_image.json from S3
+    key = f"{run_id}/{trial_id}/images/load_runner_image.json"
+    obj = s3.get_object(Bucket=s3_bucket, Key=key)
+    load_generator_details = json.loads(obj['Body'].read())
+    load_generator_image = load_generator_details["image"]
+    load_generator_image_id = load_generator_details["imageId"]
+    load_generator = {"Image": load_generator_image, "ImageId": load_generator_image_id}
+
+    benchmark_images = {
+        "controller": controller,
+        "runner": kasbench_runner,
+        "load_generator": load_generator,
+    }
+    benchmark_images_df = pd.DataFrame(benchmark_images)
+    benchmark_images_df.columns = ["KASBench Controller", "KASBench Runner", "KASBench Load Generator"]
+    benchmark_images_df = benchmark_images_df.T
+    benchmark_images_df.columns = ["Image_original", "ImageID"]
+    
+    benchmark_images_df = benchmark_images_df.reset_index()
+    benchmark_images_df = benchmark_images_df.rename(columns={"index": "Component"})
+
+    if verbose:
+        display(benchmark_images_df)
+
+    return benchmark_images_df
+
+
+def get_globeco_helm_version():
+    """Get the latest version of the globeco-helm chart"""
+
+    helm_repo_name: str = "globeco-repo"
+    helm_repo_url: str = "https://kasbench.github.io/globeco-helm"
+    # Query github to get the latest version of the globeco-helm chart
+    cmd = f"helm repo add {helm_repo_name} {helm_repo_url}"
+    subprocess.run(cmd.split(), check=True, capture_output=True)
+    cmd = f"helm search repo {helm_repo_name}/globeco --versions"
+    result = subprocess.run(cmd.split(), check=True, capture_output=True, text=True)
+    # The result is a table.  The second line is the latest version
+    lines = result.stdout.split('\n')
+    version = lines[1].split()[1]
+    return version
+
+
+def get_helm_versions(s3_bucket, run_id, verbose=False):
+    """ Get the helm chart versions from the S3 bucket """
+    
+    helm_df = None
+    helm_charts = {}
+
+    # Get all the files for the run
+    files = get_s3_file_listing(s3_bucket, run_id)
+    for file in files:
+        # select the roundtrip json results
+        if file["Key"].endswith("helm_versions.json"):
+            
+            # Fetch object content directly from S3 using boto3
+            obj = s3.get_object(Bucket=s3_bucket, Key=file["Key"])
+            helm_details = json.loads(obj['Body'].read())
+            
+            for chart in helm_details["charts"]:
+                helm_charts[chart["name"]] = {
+                    "Name": chart["name"],
+                    "Version": chart["version"],
+                    "URL": chart["url"]
+                }
+
+    helm_df = pd.DataFrame(helm_charts).T
+    return helm_df
+
+
+def download_and_load_locust_dbs(s3_bucket, run_id, run_db, data_dir):
+    files = get_s3_file_listing(s3_bucket, s3_prefix=run_id)
+
+    # Delete the log database if it already exists
+    if os.path.exists(run_db):
+        os.remove(run_db)
+
+    # Create the log database
+    create_log_database(run_db)
+
+    # Populate the log database from the locust database files
+    for file_info in files:
+        # skip non-database files
+        if not is_locust_db(file_info):
+            continue
+        
+        # parse trial, role, and filename from the S3 file info
+        trial, role, filename = parse_locust_db_file_info(file_info)
+
+        # get the autoscaler from the run details
+        run_details = get_run_details(s3_bucket, run_id, trial)
+        autoscaler = get_autoscaler(run_details)
+
+        # skip if it-operations.  It operations transactions are not tracked for response time/failure rate
+        if role == "it-operations":
+            continue
+        
+        # download the database if it doesn't already exist
+        local_path = download_locust_db(data_dir, s3_bucket, file_info["Key"], trial, role, filename)
+        
+        # load as a dataframe, augmented with run id, trial id, and role
+        df = get_raw_log_as_dataframe(local_path)
+        df["run_id" ] = run_id
+        df["trial_id" ] = trial
+        df["role" ] = role
+        df["autoscaler" ] = autoscaler
+        df["success"] = (
+            pd.to_numeric(df["status_code"], errors="coerce")
+            .between(200, 299)
+            )
+        df["failure"] = ~df["success"]
+
+        # append to the sqlite database
+        df.to_sql('logs', sqlite3.connect(run_db), if_exists='append', index=False)
+        
+def plot_mean_response_time_by_autoscaler(trial_summary_df, show=False):
+    fig, ax = plt.subplots(figsize=(8,5))
+
+    autoscalers = sorted(trial_summary_df["autoscaler"].unique())
+
+    for i, a in enumerate(autoscalers):
+        d = trial_summary_df[trial_summary_df.autoscaler == a]
+
+        # jittered trial means
+        x = np.random.normal(i, 0.04, len(d))
+        ax.scatter(x, d["mean_response_time"],
+                alpha=0.7, s=40)
+
+        mean = d["mean_response_time"].mean()
+        se = d["mean_response_time"].std(ddof=1) / np.sqrt(len(d))
+
+        ax.errorbar(
+            i,
+            mean,
+            yerr=1.96 * se,
+            fmt="o",
+            capsize=6,
+            markersize=8,
+            linewidth=2,
+        )
+
+    ax.set_xticks(range(len(autoscalers)))
+    ax.set_xticklabels(
+        [autoscaler.upper() for autoscaler in autoscalers]
+    )
+    ax.set_ylabel("Mean response time (ms)")
+    ax.set_xlabel("Autoscaler")
+
+    plt.tight_layout()
+
+    fig.savefig(
+        "../figures/response_time_by_autoscaler.png",
+        dpi=300,
+        bbox_inches="tight",
+    )
+
+    if show:
+        plt.show()
+
+    return fig, ax
+
+
+def plot_failure_rate_by_autoscaler(
+    trial_summary: pd.DataFrame,
+    *,
+    autoscaler_order: list[str] | None = None,
+    confidence_level: float = 0.95,
+    random_seed: int = 42,
+    show: bool = False,
+    include_title: bool = False,
+) -> tuple[plt.Figure, plt.Axes]:
+    """
+    Plot trial-level failure rates by autoscaler.
+
+    Each small point represents one trial. The larger point represents the
+    unweighted mean of the trial failure rates. Error bars show a two-sided
+    Student-t confidence interval for the mean.
+
+    Parameters
+    ----------
+    trial_summary:
+        DataFrame containing:
+          - autoscaler
+          - trial_id
+          - failure_rate
+
+        failure_rate must be expressed as a proportion, e.g. 0.025 for 2.5%.
+
+    autoscaler_order:
+        Optional display order. Autoscalers not listed here are appended
+        alphabetically.
+
+    confidence_level:
+        Confidence level for the error bars. Default is 0.95.
+
+    random_seed:
+        Seed used to make horizontal point jitter reproducible.
+
+    Returns
+    -------
+    tuple[matplotlib.figure.Figure, matplotlib.axes.Axes]
+        The generated figure and axes.
+    """
+
+    if autoscaler_order is None:
+        autoscaler_order=["none", "hpa", "vpa", "keda"]
+
+    required_columns = {"autoscaler", "trial_id", "failure_rate"}
+    missing_columns = required_columns - set(trial_summary.columns)
+
+    if missing_columns:
+        raise ValueError(
+            f"trial_summary is missing required columns: "
+            f"{sorted(missing_columns)}"
+        )
+
+    if not 0 < confidence_level < 1:
+        raise ValueError("confidence_level must be between 0 and 1.")
+
+    plot_df = trial_summary[
+        ["autoscaler", "trial_id", "failure_rate"]
+    ].copy()
+
+    plot_df["failure_rate"] = pd.to_numeric(
+        plot_df["failure_rate"],
+        errors="coerce",
+    )
+
+    if plot_df["failure_rate"].isna().any():
+        bad_rows = plot_df.loc[plot_df["failure_rate"].isna()]
+        raise ValueError(
+            "failure_rate contains missing or nonnumeric values. "
+            f"Invalid rows:\n{bad_rows}"
+        )
+
+    if not plot_df["failure_rate"].between(0, 1).all():
+        bad_rows = plot_df.loc[
+            ~plot_df["failure_rate"].between(0, 1)
+        ]
+        raise ValueError(
+            "failure_rate must be between 0 and 1. "
+            f"Invalid rows:\n{bad_rows}"
+        )
+
+    present_autoscalers = sorted(
+        plot_df["autoscaler"].dropna().unique()
+    )
+
+    if autoscaler_order is None:
+        autoscalers = present_autoscalers
+    else:
+        autoscalers = [
+            autoscaler
+            for autoscaler in autoscaler_order
+            if autoscaler in present_autoscalers
+        ]
+
+        autoscalers.extend(
+            autoscaler
+            for autoscaler in present_autoscalers
+            if autoscaler not in autoscalers
+        )
+
+    rng = np.random.default_rng(random_seed)
+
+    fig, ax = plt.subplots(figsize=(8, 5.5))
+
+    alpha = 1 - confidence_level
+    summary_rows = []
+
+    for position, autoscaler in enumerate(autoscalers):
+        autoscaler_df = plot_df.loc[
+            plot_df["autoscaler"] == autoscaler
+        ]
+
+        rates_percent = (
+            autoscaler_df["failure_rate"].to_numpy() * 100
+        )
+
+        # Add slight horizontal jitter so overlapping trial points remain visible.
+        jittered_x = rng.normal(
+            loc=position,
+            scale=0.045,
+            size=len(rates_percent),
+        )
+
+        ax.scatter(
+            jittered_x,
+            rates_percent,
+            s=45,
+            alpha=0.65,
+            label="Individual trial" if position == 0 else None,
+            zorder=2,
+        )
+
+        number_of_trials = len(rates_percent)
+        mean_rate = rates_percent.mean()
+
+        if number_of_trials >= 2:
+            standard_deviation = rates_percent.std(ddof=1)
+            standard_error = (
+                standard_deviation / np.sqrt(number_of_trials)
+            )
+
+            critical_value = t.ppf(
+                1 - alpha / 2,
+                df=number_of_trials - 1,
+            )
+
+            confidence_interval_half_width = (
+                critical_value * standard_error
+            )
+        else:
+            standard_deviation = np.nan
+            standard_error = np.nan
+            confidence_interval_half_width = np.nan
+
+        ax.errorbar(
+            position,
+            mean_rate,
+            yerr=confidence_interval_half_width,
+            fmt="o",
+            markersize=9,
+            capsize=7,
+            capthick=1.5,
+            linewidth=2,
+            label=(
+                f"Mean and {confidence_level:.0%} CI"
+                if position == 0
+                else None
+            ),
+            zorder=3,
+        )
+
+        summary_rows.append(
+            {
+                "autoscaler": autoscaler,
+                "trials": number_of_trials,
+                "mean_failure_rate": mean_rate / 100,
+                "sd_failure_rate": standard_deviation / 100,
+                "se_failure_rate": standard_error / 100,
+                "ci_lower": (
+                    max(
+                        0,
+                        mean_rate
+                        - confidence_interval_half_width,
+                    )
+                    / 100
+                    if number_of_trials >= 2
+                    else np.nan
+                ),
+                "ci_upper": (
+                    min(
+                        100,
+                        mean_rate
+                        + confidence_interval_half_width,
+                    )
+                    / 100
+                    if number_of_trials >= 2
+                    else np.nan
+                ),
+            }
+        )
+
+    ax.set_xticks(range(len(autoscalers)))
+    ax.set_xticklabels(
+        [autoscaler.upper() for autoscaler in autoscalers]
+    )
+
+    ax.set_xlabel("Autoscaler")
+    ax.set_ylabel("Failure rate (%)")
+    if include_title:
+        ax.set_title(
+            "Failure Rate by Autoscaler\n"
+            "Trial-level rates with mean and "
+            f"{confidence_level:.0%} confidence interval"
+        )
+
+    ax.set_ylim(bottom=0)
+    ax.grid(axis="y", alpha=0.25)
+    ax.legend()
+
+    fig.tight_layout()
+
+    # The summary can be retrieved from the axes for later use if desired.
+    ax.failure_rate_summary = pd.DataFrame(summary_rows)
+
+    if show:
+        plt.show()
+    
+    fig.savefig(
+        "../figures/failure_rate_by_autoscaler.png",
+        dpi=300,
+        bbox_inches="tight",
+    )
+
+    return fig, ax
+
+def plot_roundtrip_completion_by_autoscaler(
+    trial_summary: pd.DataFrame,
+    *,
+    autoscaler_order: list[str] | None = None,
+    confidence_level: float = 0.95,
+    random_seed: int = 42,
+    show: bool = False,
+    include_title: bool = False,
+) -> tuple[plt.Figure, plt.Axes]:
+    """
+    Plot trial-level round-trip completion percentages by autoscaler.
+
+    Each small point represents one trial. The larger point represents the
+    unweighted mean of the trial percentages. Error bars show a two-sided
+    Student-t confidence interval for the mean.
+
+    Parameters
+    ----------
+    trial_summary:
+        DataFrame containing:
+          - autoscaler
+          - trial_id
+          - roundtrip_completion_percentage
+
+        roundtrip_completion_percentage must be expressed in percentage
+        points, such as 9.3 for 9.3%, rather than 0.093.
+
+    autoscaler_order:
+        Optional display order. Autoscalers present in the dataframe but not
+        listed here are appended alphabetically.
+
+    confidence_level:
+        Confidence level for the error bars. Defaults to 0.95.
+
+    random_seed:
+        Seed used to make the horizontal jitter reproducible.
+
+    Returns
+    -------
+    tuple[matplotlib.figure.Figure, matplotlib.axes.Axes]
+        The generated figure and axes.
+    """
+
+    if autoscaler_order is None:
+        autoscaler_order = ["none", "hpa", "vpa", "keda"]
+
+    required_columns = {
+        "autoscaler",
+        "trial_id",
+        "roundtrip_completion_percentage",
+    }
+    missing_columns = required_columns - set(trial_summary.columns)
+
+    if missing_columns:
+        raise ValueError(
+            "trial_summary is missing required columns: "
+            f"{sorted(missing_columns)}"
+        )
+
+    if not 0 < confidence_level < 1:
+        raise ValueError("confidence_level must be between 0 and 1.")
+
+    plot_df = trial_summary[
+        [
+            "autoscaler",
+            "trial_id",
+            "roundtrip_completion_percentage",
+        ]
+    ].copy()
+
+    if plot_df["autoscaler"].isna().any():
+        raise ValueError("autoscaler contains missing values.")
+
+    if plot_df["trial_id"].isna().any():
+        raise ValueError("trial_id contains missing values.")
+
+    plot_df["roundtrip_completion_percentage"] = pd.to_numeric(
+        plot_df["roundtrip_completion_percentage"],
+        errors="coerce",
+    )
+
+    if plot_df["roundtrip_completion_percentage"].isna().any():
+        bad_rows = plot_df.loc[
+            plot_df["roundtrip_completion_percentage"].isna()
+        ]
+        raise ValueError(
+            "roundtrip_completion_percentage contains missing or "
+            f"nonnumeric values:\n{bad_rows}"
+        )
+
+    if not plot_df["roundtrip_completion_percentage"].between(
+        0, 100
+    ).all():
+        bad_rows = plot_df.loc[
+            ~plot_df["roundtrip_completion_percentage"].between(0, 100)
+        ]
+        raise ValueError(
+            "roundtrip_completion_percentage must be between 0 and 100. "
+            f"Invalid rows:\n{bad_rows}"
+        )
+
+    # Prevent a trial from being counted more than once for an autoscaler.
+    duplicate_mask = plot_df.duplicated(
+        subset=["autoscaler", "trial_id"],
+        keep=False,
+    )
+
+    if duplicate_mask.any():
+        duplicate_rows = plot_df.loc[
+            duplicate_mask,
+            ["autoscaler", "trial_id"],
+        ].sort_values(["autoscaler", "trial_id"])
+
+        raise ValueError(
+            "Each autoscaler/trial_id combination must appear exactly once. "
+            f"Duplicate rows:\n{duplicate_rows}"
+        )
+
+    present_autoscalers = sorted(
+        plot_df["autoscaler"].astype(str).unique()
+    )
+
+    if autoscaler_order is None:
+        autoscalers = present_autoscalers
+    else:
+        autoscalers = [
+            autoscaler
+            for autoscaler in autoscaler_order
+            if autoscaler in present_autoscalers
+        ]
+
+        autoscalers.extend(
+            autoscaler
+            for autoscaler in present_autoscalers
+            if autoscaler not in autoscalers
+        )
+
+    if not autoscalers:
+        raise ValueError("No autoscaler data is available to plot.")
+
+    rng = np.random.default_rng(random_seed)
+    alpha = 1 - confidence_level
+
+    fig, ax = plt.subplots(figsize=(8, 5.5))
+
+    summary_rows: list[dict[str, float | int | str]] = []
+
+    for position, autoscaler in enumerate(autoscalers):
+        autoscaler_df = plot_df.loc[
+            plot_df["autoscaler"] == autoscaler
+        ].sort_values("trial_id")
+
+        percentages = autoscaler_df[
+            "roundtrip_completion_percentage"
+        ].to_numpy(dtype=float)
+
+        number_of_trials = len(percentages)
+
+        # Slight horizontal jitter keeps overlapping trial points visible.
+        jittered_x = rng.normal(
+            loc=position,
+            scale=0.045,
+            size=number_of_trials,
+        )
+
+        ax.scatter(
+            jittered_x,
+            percentages,
+            s=45,
+            alpha=0.65,
+            label="Individual trial" if position == 0 else None,
+            zorder=2,
+        )
+
+        mean_percentage = percentages.mean()
+
+        if number_of_trials >= 2:
+            standard_deviation = percentages.std(ddof=1)
+            standard_error = (
+                standard_deviation / np.sqrt(number_of_trials)
+            )
+
+            critical_value = t.ppf(
+                1 - alpha / 2,
+                df=number_of_trials - 1,
+            )
+
+            confidence_interval_half_width = (
+                critical_value * standard_error
+            )
+
+            confidence_interval_lower = max(
+                0.0,
+                mean_percentage - confidence_interval_half_width,
+            )
+            confidence_interval_upper = min(
+                100.0,
+                mean_percentage + confidence_interval_half_width,
+            )
+
+            # Asymmetric errors allow confidence bounds to be clipped to
+            # the logically valid 0%-100% interval.
+            lower_error = mean_percentage - confidence_interval_lower
+            upper_error = confidence_interval_upper - mean_percentage
+            yerr = np.array([[lower_error], [upper_error]])
+        else:
+            standard_deviation = np.nan
+            standard_error = np.nan
+            critical_value = np.nan
+            confidence_interval_half_width = np.nan
+            confidence_interval_lower = np.nan
+            confidence_interval_upper = np.nan
+            yerr = None
+
+        ax.errorbar(
+            position,
+            mean_percentage,
+            yerr=yerr,
+            fmt="o",
+            markersize=9,
+            capsize=7,
+            capthick=1.5,
+            linewidth=2,
+            label=(
+                f"Mean and {confidence_level:.0%} CI"
+                if position == 0
+                else None
+            ),
+            zorder=3,
+        )
+
+        summary_rows.append(
+            {
+                "autoscaler": autoscaler,
+                "trials": number_of_trials,
+                "mean_roundtrip_completion_percentage": mean_percentage,
+                "sd_roundtrip_completion_percentage": standard_deviation,
+                "se_roundtrip_completion_percentage": standard_error,
+                "t_critical": critical_value,
+                "ci_half_width": confidence_interval_half_width,
+                "ci_lower": confidence_interval_lower,
+                "ci_upper": confidence_interval_upper,
+            }
+        )
+
+    ax.set_xticks(range(len(autoscalers)))
+    ax.set_xticklabels(
+        [autoscaler.upper() for autoscaler in autoscalers]
+    )
+
+    ax.set_xlabel("Autoscaler")
+    ax.set_ylabel("Round-trip completion percentage (%)")
+
+    if include_title:
+        ax.set_title(
+            "Round-Trip Completion by Autoscaler\n"
+            "Trial-level percentages with mean and "
+            f"{confidence_level:.0%} confidence interval"
+        )
+
+    # Start at zero because the metric has a meaningful zero.
+    # Let Matplotlib choose the upper bound unless the values approach 100%.
+    ax.set_ylim(bottom=0)
+
+    ax.grid(
+        axis="y",
+        alpha=0.25,
+    )
+    ax.legend()
+
+    fig.tight_layout()
+
+    # Attach the statistics used in the chart for convenient retrieval.
+    ax.roundtrip_completion_summary = pd.DataFrame(summary_rows)
+
+    if show:
+        plt.show()
+
+    fig.savefig(
+        "../figures/roundtrip_completion_by_autoscaler.png",
+        dpi=300,
+        bbox_inches="tight",
+    )
+
+    return fig, ax
+
+
+def images_to_html(images_df):
+    df = images_df.copy()
+
+    
+
+    # Build the combined Image / ImageID cell.
+    # Escape values so characters such as &, <, and > remain valid HTML.
+    df["Image"] = df.apply(
+        lambda row: (
+            f"{escape(str(row['Image_original']))}"
+            f"<br>"
+            f"<span class=\"image-id\">{escape(str(row['ImageID']))}</span>"
+        ),
+        axis=1
+    )
+
+    # Generate the HTML table.
+    html = df[["Component", "Image"]].to_html(
+        index=False,
+        escape=False,
+        header=True,
+        classes="data-table compact",
+        border=0
+    )
+
+    # html = html.replace("Deployment_display", "Deployment")
+    # html = html.replace("Image_display", "Image")
+
+    return html
+
+
+
+def merged_trial_summary_df_to_html(merged_trial_summary_df):
+    """Returns the merge summary dataframe as a HTML table."""
+    df = merged_trial_summary_df.copy()
+
+    df = df[
+        [
+            "trial_id",
+            "autoscaler",
+            "requests",
+            "mean_response_time",
+            "failures",
+            "failure_rate",
+            "roundtrip_completion_percentage",
+        ]
+    ]
+
+    df.columns = [
+        "Trial ID",
+        "Autoscaler",
+        "Requests",
+        "Mean Response Time (ms)",
+        "Failures",
+        "Failure Rate",
+        "Round-trip Completion (%)",
+    ]
+
+    # Clean the column axis name BEFORE converting to Styler
+    df.columns.name = None
+
+    # Sort by Trial ID
+    df = df.sort_values(by=["Trial ID"])
+
+    # Format columns (DataFrame level)
+    df["Failure Rate"] = df["Failure Rate"].apply(lambda x: f"{x:.3%}")
+    df["Round-trip Completion (%)"] = df["Round-trip Completion (%)"].apply(
+        lambda x: f"{x:.1f}%"
+    )
+
+    # Initialize Styler
+    style = df.style.format({"Mean Response Time (ms)": "{:.0f}"})
+
+    # Apply properties and styles
+    style = style.set_properties(**{"text-align": "center"})
+    style = style.set_table_styles(
+        [{"selector": "th", "props": [("text-align", "center")]}]
+    )
+
+    # Capitalize the autoscaler column (all caps)
+    style = style.set_properties(
+        subset=["Autoscaler"], **{"text-transform": "uppercase"}
+    )
+
+    # Hide the index on the Styler object
+    style = style.hide(axis="index")
+
+    # Generate the HTML table using Styler.to_html options
+    html = style.to_html(
+        escape=False,
+        encoding="utf-8",  # replacing structural parameters not supported by styler
+    )
+
+    # If you need to inject custom classes or borders into the <table> tag,
+    # it is safest to do it on the final string or via set_table_attributes
+    style = style.set_table_attributes('class="data-table compact" border="0"')
+    html = style.to_html(escape=False)
+
+
+    return html
 

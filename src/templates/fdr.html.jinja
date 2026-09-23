@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>{{ title }}</title>
+</head>
+<body>
+
+  <h1>{{ title }}</h1>
+  
+  <h2>Preamble</h2>
+
+  <p class="body">This report documents the results obtained from an execution of the KASBench Kubernetes 
+  Autoscaling Benchmark.  
+
+  <p>
+  Talk about completely random design.
+  </p>
+
+  <p>
+  Talk about run duration and number of trials
+  </p>
+
+  <p>
+  Insert a section for each autoscaler (how configured)
+  </p>
+
+  </p>
+
+  <h2>Benchmark Metadata</h2>
+
+  <div class="table-wrap">
+  {{ metadata_table_html | safe }}
+  </div>
+
+  <h2>Software artifacts</h2>
+
+  <h3>Benchmark Components</h3>
+  <div class="table-wrap">
+  {{ benchmark_images_table_html | safe }}
+  </div>
+
+  <h3>Helm Charts</h3>
+  <div class="table-wrap">
+  {{ helm_versions_table_html | safe }}
+  </div>
+
+
+  <h3>Stateful Services</h3>
+  <div class="table-wrap">
+  {{ statefulsets_table_html | safe }}
+  </div>
+
+  <h3>Stateless Services</h3>
+  
+  <div class="table-wrap">
+  {{ deployments_table_html | safe }}
+  </div>
+
+<h2>Raw Performance Metrics</h2>
+
+<h3>Summarized Performance Metrics by Trial</h3>
+  <div class="table-wrap">
+  {{ merged_trial_summary_table_html | safe }}
+  </div>
+
+  
+ 
+</body>
+</html>
