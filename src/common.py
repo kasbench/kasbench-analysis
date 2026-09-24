@@ -22,7 +22,7 @@ from scipy.stats import t
 from prometheus_api_client import PrometheusConnect, MetricRangeDataFrame
 import matplotlib.pyplot as plt
 from scipy import stats
-
+from latex2mathml.converter import convert
 
 s3 = boto3.client("s3")
 
@@ -433,11 +433,11 @@ def calculate_theta_metrics(
             Experiment-level mean, standard deviation, SEM, and trial count
             for each autoscaler.
     """
-    if slo_rt_ms <= 0:
-        raise ValueError("slo_rt_ms must be greater than zero.")
+    if slo_rt_ms < 0:
+        raise ValueError("slo_rt_ms must be greater than or equal to zero.")
 
-    if not 0 < slo_fr <= 1:
-        raise ValueError("slo_fr must be greater than 0 and no greater than 1.")
+    if not 0 <= slo_fr <= 1:
+        raise ValueError("slo_fr must be greater than or equal to 0 and no greater than 1.")
 
     required_columns = {
         autoscaler_col,
@@ -586,10 +586,12 @@ def append_time_slice(df, earliest_start_time, latest_end_time, time_slice_secon
     # Make a copy of the dataframe
     df = df.copy()
 
-    # Convert start_time to datetime and subtract the minimum start_time to get a timedelta
-    df["start_time_dt"] = pd.to_datetime(df.start_time, format="mixed")
+    # Convert start_time to datetime. The time_slice bins are timezone-aware
+    # (UTC), so start_time_dt must also be tz-aware in UTC or pd.cut will place
+    # every value outside all bins and produce NaN. Localize naive timestamps to
+    # UTC, and convert already-aware timestamps to UTC.
+    df["start_time_dt"] = pd.to_datetime(df.start_time, format="mixed", utc=True)
     latest_end_time = latest_end_time + pd.Timedelta(seconds=time_slice_seconds)
-
     # Calculate interval_range from the lowest start time to the highest start time of the dataframe
     time_slice_index = pd.interval_range(
         start=earliest_start_time,
@@ -603,7 +605,7 @@ def append_time_slice(df, earliest_start_time, latest_end_time, time_slice_secon
         df.start_time_dt,
         bins=time_slice_index,
         include_lowest=True, 
-        labels=time_slice_index[:],
+        # labels=time_slice_index[:],
     )
 
     # Remove the df.start_time_dt column
@@ -1018,6 +1020,30 @@ def get_run_start_and_end_times(files, s3_bucket, run_id):
             latest_end = max(latest_end, end)
     
     return earliest_start, latest_end
+
+def get_run_start_and_end_times_from_db(run_db):
+    """Get the start and end time of benchmark runs"""
+    conn = sqlite3.connect(run_db)
+    cursor = conn.cursor()
+
+    # Get the minimum and maximum timestamps
+    cursor.execute("SELECT MIN(start_time), MAX(start_time) FROM logs")
+    start_time, end_time = cursor.fetchone()
+    
+    # Convert timestamps to datetime objects with timezone
+    # Note: the timestamps in the database are already in UTC.
+    # start_time and end_time are strings in the form "2026-09-04T15:26:11Z".  
+    
+    # end_time = end_time.replace(tzinfo=datetime.timezone.utc)
+    # start_time = datetime.datetime.strptime(start_time, "%Y-%m-%dT%H:%M:%SZ")
+    # end_time = datetime.datetime.strptime(end_time, "%Y-%m-%dT%H:%M:%SZ")
+    conn.close()
+
+    return (
+        datetime.datetime.fromisoformat(start_time).replace(tzinfo=datetime.timezone.utc),
+        datetime.datetime.fromisoformat(end_time).replace(tzinfo=datetime.timezone.utc),
+    )
+        
 
 
 def get_trial_start_and_end_times(files, s3_bucket, run_id, trial_id):
@@ -4013,4 +4039,203 @@ def autoscaler_summary_df_to_html(autoscaler_summary_df):
 
 
     return html
+
+
+def calculate_weighted_synchronous_theta(df, earliest_start_time, latest_end_time, slo_rt_ms=100, 
+        slo_fr=0.01, gamma=0.50, omega=0.50, time_slice_seconds=30):
+    """Returns the theta value for the given dataframe."""
+    df = df.copy()
+    df = append_time_slice(df, earliest_start_time, latest_end_time, time_slice_seconds=time_slice_seconds)
+    theta_results = calculate_theta_metrics(df, slo_rt_ms=slo_rt_ms, slo_fr=slo_fr)
+    weighted_theta_results = add_weighted_theta(
+        theta_results.autoscalers,
+        gamma=gamma,
+        omega=omega,
+    )
+    return weighted_theta_results, theta_results
+
+
+
+import re
+
+def latex_to_stacked_html(tex: str) -> str:
+    """
+    Renders expressions like r'\theta^{RT}_{U}', r'\theta^{RT}', or r'\theta'
+    tightly inline with balanced super/subscript vertical positioning.
+    """
+    theta = "&#952;"
+    tau = "&#964;"
+    tex = tex.replace(r"\theta", theta)
+    tex = tex.replace(r"\tau", tau)
+
+    if theta in tex:
+        pattern = r"(&#952;|[a-zA-Z])(?:(?:\^\{([^}]+)\}|_\{([^}]+)\})(?:_\{([^}]+)\}|\^\{([^}]+)\})?)?"
+    elif tau in tex:
+        pattern = r"(&#964;|[a-zA-Z])(?:(?:\^\{([^}]+)\}|_\{([^}]+)\})(?:_\{([^}]+)\}|\^\{([^}]+)\})?)?"
+    else:
+        return tex
+    match = re.match(pattern, tex.strip())
+    if not match:
+        return tex
+
+    base = match.group(1)
+    sup = match.group(2) or match.group(5) or ""
+    sub = match.group(3) or match.group(4) or ""
+
+    # Case 1: Plain symbol
+    if not sup and not sub:
+        return base
+
+    # Case 2: Superscript only
+    if sup and not sub:
+        return f'<span style="white-space:nowrap;">{base}<sup style="font-size:0.68em; line-height:0;">{sup}</sup></span>'
+
+    # Case 3: Subscript only
+    if sub and not sup:
+        return f'<span style="white-space:nowrap;">{base}<sub style="font-size:0.68em; line-height:0;">{sub}</sub></span>'
+
+    # Case 4: Vertically stacked super- and subscript
+    return (
+        f'<span style="display:inline-flex; align-items:center; white-space:nowrap;">'
+        f'{base}'
+        f'<span style="display:inline-grid; grid-template-rows:auto auto; '
+        f'font-size:0.62em; line-height:0.95; vertical-align:middle; '
+        f'margin-left:1.5px; position:relative; top:-0.18em; text-align:left;">'
+        f'<span>{sup}</span>'
+        f'<span>{sub}</span>'
+        f'</span>'
+        f'</span>'
+    )
+
+
+
+
+def weighted_synchronous_theta_to_html(df):
+    df = df.copy()
+
+    columns_order = [
+        "autoscaler",
+        "theta_u_rt_mean", 
+        "theta_o_rt_mean", 
+        "theta_u_fr_mean", 
+        "theta_o_fr_mean",
+        "theta_rt_mean", 
+        "theta_fr_mean", 
+        "theta_mean"
+    ]
+    df = df[columns_order]
+    df.rename(columns={"autoscaler": "Autoscaler"}, inplace=True)
+    df.columns.name = None
+
+    # Column mapping dictionary
+    header_replacements = {
+        "theta_u_rt_mean": latex_to_stacked_html(r"\theta^{RT}_{U}"),
+        "theta_o_rt_mean": latex_to_stacked_html(r"\theta^{RT}_{O}"),
+        "theta_u_fr_mean": latex_to_stacked_html(r"\theta^{FR}_{U}"),
+        "theta_o_fr_mean": latex_to_stacked_html(r"\theta^{FR}_{O}"),
+        "theta_rt_mean": latex_to_stacked_html(r"\theta^{RT}"),
+        "theta_fr_mean": latex_to_stacked_html(r"\theta^{FR}"),
+        "theta_mean": latex_to_stacked_html(r"\theta^{S}"),
+    }
+
+    # Initialize Styler
+    style = df.style.format({col: "{:.3f}" for col in df.columns if col != "Autoscaler"})
+    
+    style = style.set_properties(**{"text-align": "center"})
+    style = style.set_table_styles(
+        [{"selector": "th", "props": [("text-align", "center")]}]
+    )
+    style = style.set_properties(
+        subset=["Autoscaler"], **{"text-transform": "uppercase"}
+    )
+    style = style.hide(axis="index")
+    style = style.set_table_attributes('class="data-table compact" border="0"')
+
+    html = style.to_html(escape=False)
+
+    # Perform all column name replacements
+    for original_col, formatted_col in header_replacements.items():
+        html = html.replace(original_col, formatted_col)
+
+    return html
+
+
+def calculate_weighted_synchronous_tau(df, earliest_start_time, latest_end_time, slo_rt_ms=100, 
+        slo_fr=0.01, gamma=0.50, omega=0.50, time_slice_seconds=30, tolerance=0.20):
+    """ Calculates weighted tau for a dataframe """
+    
+    df = df.copy()
+    
+    df = append_time_slice(
+        df, 
+        earliest_start_time, 
+        latest_end_time, 
+        time_slice_seconds=time_slice_seconds
+    )
+    
+    tau_results = calculate_tau_metrics(
+        df, 
+        slo_rt_ms=slo_rt_ms, 
+        slo_fr=slo_fr,
+        tolerance=tolerance
+    )
+    
+    weighted_tau_results = add_weighted_tau(
+        tau_results.autoscalers,
+        gamma=gamma,
+        omega=omega,
+    )
+    
+    return weighted_tau_results, tau_results
+
+
+def weighted_synchronous_tau_to_html(df):
+    df = df.copy()
+
+    columns_order = [
+        "autoscaler",
+        "tau_u_rt_mean", 
+        "tau_o_rt_mean", 
+        "tau_u_fr_mean", 
+        "tau_o_fr_mean",
+        "tau_rt_mean", 
+        "tau_fr_mean", 
+        "tau_mean"
+    ]
+    df = df[columns_order]
+    df.rename(columns={"autoscaler": "Autoscaler"}, inplace=True)
+    df.columns.name = None
+
+    # Column mapping dictionary
+    header_replacements = {
+        "tau_u_rt_mean": latex_to_stacked_html(r"\tau^{RT}_{U}"),
+        "tau_o_rt_mean": latex_to_stacked_html(r"\tau^{RT}_{O}"),
+        "tau_u_fr_mean": latex_to_stacked_html(r"\tau^{FR}_{U}"),
+        "tau_o_fr_mean": latex_to_stacked_html(r"\tau^{FR}_{O}"),
+        "tau_rt_mean": latex_to_stacked_html(r"\tau^{RT}"),
+        "tau_fr_mean": latex_to_stacked_html(r"\tau^{FR}"),
+        "tau_mean": latex_to_stacked_html(r"\tau^{S}"),
+    }
+
+    # Initialize Styler
+    style = df.style.format({col: "{:.3f}" for col in df.columns if col != "Autoscaler"})
+    
+    style = style.set_properties(**{"text-align": "center"})
+    style = style.set_table_styles(
+        [{"selector": "th", "props": [("text-align", "center")]}]
+    )
+    style = style.set_properties(
+        subset=["Autoscaler"], **{"text-transform": "uppercase"}
+    )
+    style = style.hide(axis="index")
+    style = style.set_table_attributes('class="data-table compact" border="0"')
+
+    html = style.to_html(escape=False)
+
+    # Perform all column name replacements
+    for original_col, formatted_col in header_replacements.items():
+        html = html.replace(original_col, formatted_col)
+
+    return html
+
 

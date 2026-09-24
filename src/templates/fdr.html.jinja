@@ -83,6 +83,18 @@
     <img src="{{ round_trip_plot_path }}" alt="Response time plot">
     <p class="fig-caption">Figure 3. Mean round trip percentage by autoscaler.</p>
   </div>
+
+  <h2>Comparative Autoscaler Metrics</h2>
+
+  <h3>Synchronous Misprovisioning Penalty (&theta;<sup>S</sup>) by Autoscaler</h3>
+  <div class="table-wrap">
+  {{ theta_table_html | safe }}
+  </div>
+ 
+  <h3>Synchronous Misprovisioned Timeshare (&tau;<sup>S</sup>) by Autoscaler</h3>
+  <div class="table-wrap">
+  {{ tau_table_html | safe }}
+  </div>
  
 </body>
 </html>
