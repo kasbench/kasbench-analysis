@@ -366,6 +366,224 @@ def merge_roundtrip_completion_percentage(files, s3_bucket, trial_summary_df, ru
     
     return merged_trial_summary_df
 
+################## Delete Below  ########################
+
+# @dataclass(frozen=True)
+# class ThetaResults:
+#     """Results produced by calculate_theta_metrics."""
+
+#     time_slices: pd.DataFrame
+#     trials: pd.DataFrame
+#     autoscalers: pd.DataFrame
+
+
+# def calculate_theta_metrics(
+#     requests_df: pd.DataFrame,
+#     *,
+#     slo_rt_ms: float = 100.0,
+#     slo_fr: float = 0.01,
+#     autoscaler_col: str = "autoscaler",
+#     trial_col: str = "trial_id",
+#     time_slice_col: str = "time_slice",
+#     response_time_col: str = "response_time",
+#     failure_col: str = "failure",
+# ) -> ThetaResults:
+#     """
+#     Calculate all four theta metrics:
+
+#         theta_u_rt: response time above SLO
+#         theta_o_rt: response time below SLO
+#         theta_u_fr: failure rate above SLO
+#         theta_o_fr: failure rate below SLO
+
+#     The input dataframe contains one row per request and is already assigned
+#     to fixed-duration time slices.
+
+#     For each time slice:
+
+#         RT_t = mean response time of requests in the slice
+
+#         FR_t = number of failed requests / total number of request rows
+
+#     Because all time slices have equal duration, Delta-t cancels during
+#     normalization, and each theta is 100 times the mean normalized deviation
+#     across time slices.
+
+#     Parameters
+#     ----------
+#     requests_df:
+#         Request-level dataframe.
+
+#     slo_rt_ms:
+#         Response-time SLO in milliseconds.
+
+#     slo_fr:
+#         Failure-rate SLO expressed as a proportion. For example, use 0.01
+#         for a 1% failure-rate SLO.
+
+#     Returns
+#     -------
+#     ThetaResults
+#         time_slices:
+#             One row per autoscaler, trial, and time slice.
+
+#         trials:
+#             One row per autoscaler and trial.
+
+#         autoscalers:
+#             Experiment-level mean, standard deviation, SEM, and trial count
+#             for each autoscaler.
+#     """
+#     if slo_rt_ms < 0:
+#         raise ValueError("slo_rt_ms must be greater than or equal to zero.")
+
+#     if not 0 <= slo_fr <= 1:
+#         raise ValueError("slo_fr must be greater than or equal to 0 and no greater than 1.")
+
+#     required_columns = {
+#         autoscaler_col,
+#         trial_col,
+#         time_slice_col,
+#         response_time_col,
+#         failure_col,
+#     }
+
+#     missing_columns = required_columns.difference(requests_df.columns)
+
+#     if missing_columns:
+#         raise ValueError(
+#             "The dataframe is missing required columns: "
+#             + ", ".join(sorted(missing_columns))
+#         )
+
+#     df = requests_df.copy()
+
+#     df["is_success"] = pd.to_numeric(df["status_code"], errors="coerce").between(200, 299)
+    
+#     df[response_time_col] = pd.to_numeric(
+#         df[response_time_col],
+#         errors="coerce",
+#     )
+
+#     df[failure_col] = pd.to_numeric(
+#         df[failure_col],
+#         errors="coerce",
+#     )
+
+#     if df[response_time_col].isna().any():
+#         raise ValueError(
+#             f"Column {response_time_col!r} contains missing or nonnumeric values."
+#         )
+
+#     if df[failure_col].isna().any():
+#         raise ValueError(
+#             f"Column {failure_col!r} contains missing or nonnumeric values."
+#         )
+
+#     invalid_failure_values = ~df[failure_col].isin([0, 1])
+
+#     if invalid_failure_values.any():
+#         invalid_values = sorted(
+#             df.loc[invalid_failure_values, failure_col].unique().tolist()
+#         )
+#         raise ValueError(
+#             f"Column {failure_col!r} must contain only 0 and 1. "
+#             f"Invalid values: {invalid_values}"
+#         )
+
+#     group_columns = [
+#         autoscaler_col,
+#         trial_col,
+#         time_slice_col,
+#     ]
+
+#     # .size() counts request rows independently of missing values in any
+#     # particular data column.
+#     time_slices = (
+#         df.groupby(group_columns, observed=True, dropna=False)
+#         .agg(
+#             mean_response_time_ms=(response_time_col, "mean"),
+#             failures=(failure_col, "sum"),
+#             requests=(failure_col, "size"),
+#         )
+#         .reset_index()
+#     )
+
+#     time_slices["failure_rate"] = (
+#         time_slices["failures"] / time_slices["requests"]
+#     )
+
+#     # Underprovisioning: observed result is worse than the SLO.
+#     time_slices["normalized_u_rt"] = (
+#         time_slices["mean_response_time_ms"] - slo_rt_ms
+#     ).clip(lower=0) / slo_rt_ms
+
+#     time_slices["normalized_u_fr"] = (
+#         time_slices["failure_rate"] - slo_fr
+#     ).clip(lower=0) / slo_fr
+
+#     # Overprovisioning: observed result is better than the SLO.
+#     time_slices["normalized_o_rt"] = (
+#         slo_rt_ms - time_slices["mean_response_time_ms"]
+#     ).clip(lower=0) / slo_rt_ms
+
+#     time_slices["normalized_o_fr"] = (
+#         slo_fr - time_slices["failure_rate"]
+#     ).clip(lower=0) / slo_fr
+
+#     trial_group_columns = [
+#         autoscaler_col,
+#         trial_col,
+#     ]
+
+#     trials = (
+#         time_slices
+#         .groupby(trial_group_columns, observed=True, dropna=False)
+#         .agg(
+#             theta_u_rt=("normalized_u_rt", lambda values: 100.0 * values.mean()),
+#             theta_o_rt=("normalized_o_rt", lambda values: 100.0 * values.mean()),
+#             theta_u_fr=("normalized_u_fr", lambda values: 100.0 * values.mean()),
+#             theta_o_fr=("normalized_o_fr", lambda values: 100.0 * values.mean()),
+#             time_slices=(time_slice_col, "size"),
+#             requests=("requests", "sum"),
+#         )
+#         .reset_index()
+#     )
+
+#     metric_columns = [
+#         "theta_u_rt",
+#         "theta_o_rt",
+#         "theta_u_fr",
+#         "theta_o_fr",
+#     ]
+
+#     autoscalers = (
+#         trials
+#         .groupby(autoscaler_col, observed=True, dropna=False)[metric_columns]
+#         .agg(["mean", "std", "count"])
+#     )
+
+#     autoscalers.columns = [
+#         f"{metric}_{statistic}"
+#         for metric, statistic in autoscalers.columns
+#     ]
+
+#     autoscalers = autoscalers.reset_index()
+
+#     for metric in metric_columns:
+#         autoscalers[f"{metric}_sem"] = (
+#             autoscalers[f"{metric}_std"]
+#             / np.sqrt(autoscalers[f"{metric}_count"])
+#         )
+
+#     return ThetaResults(
+#         time_slices=time_slices,
+#         trials=trials,
+#         autoscalers=autoscalers,
+#     )    
+
+############## DELETE ABOVE ################
+
 
 @dataclass(frozen=True)
 class ThetaResults:
@@ -400,9 +618,12 @@ def calculate_theta_metrics(
 
     For each time slice:
 
-        RT_t = mean response time of requests in the slice
+        RT_t = mean response time of SUCCESSFUL requests in the slice
 
         FR_t = number of failed requests / total number of request rows
+
+    Response-time calculations therefore exclude failed requests, while
+    failure-rate calculations include all requests.
 
     Because all time slices have equal duration, Delta-t cancels during
     normalization, and each theta is 100 times the mean normalized deviation
@@ -433,11 +654,13 @@ def calculate_theta_metrics(
             Experiment-level mean, standard deviation, SEM, and trial count
             for each autoscaler.
     """
-    if slo_rt_ms < 0:
-        raise ValueError("slo_rt_ms must be greater than or equal to zero.")
+    if slo_rt_ms <= 0:
+        raise ValueError("slo_rt_ms must be greater than zero.")
 
-    if not 0 <= slo_fr <= 1:
-        raise ValueError("slo_fr must be greater than or equal to 0 and no greater than 1.")
+    if not 0 < slo_fr <= 1:
+        raise ValueError(
+            "slo_fr must be greater than 0 and not greater than 1."
+        )
 
     required_columns = {
         autoscaler_col,
@@ -445,6 +668,7 @@ def calculate_theta_metrics(
         time_slice_col,
         response_time_col,
         failure_col,
+        "status_code",
     }
 
     missing_columns = required_columns.difference(requests_df.columns)
@@ -456,6 +680,19 @@ def calculate_theta_metrics(
         )
 
     df = requests_df.copy()
+
+    # ------------------------------------------------------------------
+    # Identify successful requests.
+    # ------------------------------------------------------------------
+
+    df["is_success"] = (
+        pd.to_numeric(df["status_code"], errors="coerce")
+        .between(200, 299)
+    )
+
+    # ------------------------------------------------------------------
+    # Validate/convert response time and failure indicator.
+    # ------------------------------------------------------------------
 
     df[response_time_col] = pd.to_numeric(
         df[response_time_col],
@@ -469,24 +706,44 @@ def calculate_theta_metrics(
 
     if df[response_time_col].isna().any():
         raise ValueError(
-            f"Column {response_time_col!r} contains missing or nonnumeric values."
+            f"Column {response_time_col!r} contains missing "
+            "or nonnumeric values."
         )
 
     if df[failure_col].isna().any():
         raise ValueError(
-            f"Column {failure_col!r} contains missing or nonnumeric values."
+            f"Column {failure_col!r} contains missing "
+            "or nonnumeric values."
         )
 
     invalid_failure_values = ~df[failure_col].isin([0, 1])
 
     if invalid_failure_values.any():
         invalid_values = sorted(
-            df.loc[invalid_failure_values, failure_col].unique().tolist()
+            df.loc[
+                invalid_failure_values,
+                failure_col,
+            ].unique().tolist()
         )
+
         raise ValueError(
             f"Column {failure_col!r} must contain only 0 and 1. "
             f"Invalid values: {invalid_values}"
         )
+
+    # ------------------------------------------------------------------
+    # Response-time value used for RT metrics.
+    #
+    # Failed requests are deliberately set to NaN. Pandas mean() ignores
+    # NaN values, so only successful requests contribute to RT_t.
+    #
+    # IMPORTANT: We do NOT remove failed requests from df because they
+    # must still contribute to failures, requests, and failure_rate.
+    # ------------------------------------------------------------------
+
+    df["_successful_response_time"] = df[response_time_col].where(
+        df["is_success"]
+    )
 
     group_columns = [
         autoscaler_col,
@@ -494,39 +751,101 @@ def calculate_theta_metrics(
         time_slice_col,
     ]
 
-    # .size() counts request rows independently of missing values in any
-    # particular data column.
+    # ------------------------------------------------------------------
+    # Calculate time-slice statistics.
+    #
+    # requests:
+    #     ALL requests
+    #
+    # failures:
+    #     Failed requests among ALL requests
+    #
+    # successful_requests:
+    #     Requests contributing to mean_response_time_ms
+    #
+    # mean_response_time_ms:
+    #     Mean response time of SUCCESSFUL requests only
+    # ------------------------------------------------------------------
+
     time_slices = (
-        df.groupby(group_columns, observed=True, dropna=False)
+        df.groupby(
+            group_columns,
+            observed=True,
+            dropna=False,
+        )
         .agg(
-            mean_response_time_ms=(response_time_col, "mean"),
-            failures=(failure_col, "sum"),
-            requests=(failure_col, "size"),
+            mean_response_time_ms=(
+                "_successful_response_time",
+                "mean",
+            ),
+            successful_requests=(
+                "is_success",
+                "sum",
+            ),
+            failures=(
+                failure_col,
+                "sum",
+            ),
+            requests=(
+                failure_col,
+                "size",
+            ),
         )
         .reset_index()
     )
 
     time_slices["failure_rate"] = (
-        time_slices["failures"] / time_slices["requests"]
+        time_slices["failures"]
+        / time_slices["requests"]
     )
 
+    # ------------------------------------------------------------------
     # Underprovisioning: observed result is worse than the SLO.
+    # ------------------------------------------------------------------
+
     time_slices["normalized_u_rt"] = (
-        time_slices["mean_response_time_ms"] - slo_rt_ms
-    ).clip(lower=0) / slo_rt_ms
+        (
+            time_slices["mean_response_time_ms"]
+            - slo_rt_ms
+        )
+        .clip(lower=0)
+        / slo_rt_ms
+    )
 
     time_slices["normalized_u_fr"] = (
-        time_slices["failure_rate"] - slo_fr
-    ).clip(lower=0) / slo_fr
+        (
+            time_slices["failure_rate"]
+            - slo_fr
+        )
+        .clip(lower=0)
+        / slo_fr
+    )
 
+    # ------------------------------------------------------------------
     # Overprovisioning: observed result is better than the SLO.
+    # ------------------------------------------------------------------
+
     time_slices["normalized_o_rt"] = (
-        slo_rt_ms - time_slices["mean_response_time_ms"]
-    ).clip(lower=0) / slo_rt_ms
+        (
+            slo_rt_ms
+            - time_slices["mean_response_time_ms"]
+        )
+        .clip(lower=0)
+        / slo_rt_ms
+    )
 
     time_slices["normalized_o_fr"] = (
-        slo_fr - time_slices["failure_rate"]
-    ).clip(lower=0) / slo_fr
+        (
+            slo_fr
+            - time_slices["failure_rate"]
+        )
+        .clip(lower=0)
+        / slo_fr
+    )
+
+    # ------------------------------------------------------------------
+    # Trial-level theta metrics.
+    # ------------------------------------------------------------------
 
     trial_group_columns = [
         autoscaler_col,
@@ -535,14 +854,44 @@ def calculate_theta_metrics(
 
     trials = (
         time_slices
-        .groupby(trial_group_columns, observed=True, dropna=False)
+        .groupby(
+            trial_group_columns,
+            observed=True,
+            dropna=False,
+        )
         .agg(
-            theta_u_rt=("normalized_u_rt", lambda values: 100.0 * values.mean()),
-            theta_o_rt=("normalized_o_rt", lambda values: 100.0 * values.mean()),
-            theta_u_fr=("normalized_u_fr", lambda values: 100.0 * values.mean()),
-            theta_o_fr=("normalized_o_fr", lambda values: 100.0 * values.mean()),
-            time_slices=(time_slice_col, "size"),
-            requests=("requests", "sum"),
+            theta_u_rt=(
+                "normalized_u_rt",
+                lambda values: 100.0 * values.mean(),
+            ),
+            theta_o_rt=(
+                "normalized_o_rt",
+                lambda values: 100.0 * values.mean(),
+            ),
+            theta_u_fr=(
+                "normalized_u_fr",
+                lambda values: 100.0 * values.mean(),
+            ),
+            theta_o_fr=(
+                "normalized_o_fr",
+                lambda values: 100.0 * values.mean(),
+            ),
+            time_slices=(
+                time_slice_col,
+                "size",
+            ),
+            requests=(
+                "requests",
+                "sum",
+            ),
+            successful_requests=(
+                "successful_requests",
+                "sum",
+            ),
+            failures=(
+                "failures",
+                "sum",
+            ),
         )
         .reset_index()
     )
@@ -554,9 +903,17 @@ def calculate_theta_metrics(
         "theta_o_fr",
     ]
 
+    # ------------------------------------------------------------------
+    # Autoscaler-level summaries.
+    # ------------------------------------------------------------------
+
     autoscalers = (
         trials
-        .groupby(autoscaler_col, observed=True, dropna=False)[metric_columns]
+        .groupby(
+            autoscaler_col,
+            observed=True,
+            dropna=False,
+        )[metric_columns]
         .agg(["mean", "std", "count"])
     )
 
@@ -577,7 +934,7 @@ def calculate_theta_metrics(
         time_slices=time_slices,
         trials=trials,
         autoscalers=autoscalers,
-    )    
+    )
 
 
 def append_time_slice(df, earliest_start_time, latest_end_time, time_slice_seconds=30):
@@ -640,6 +997,227 @@ class TauResults:
     autoscalers: pd.DataFrame
 
 
+# def calculate_tau_metrics(
+#     requests_df: pd.DataFrame,
+#     *,
+#     slo_rt_ms: float = 100.0,
+#     slo_fr: float = 0.01,
+#     autoscaler_col: str = "autoscaler",
+#     trial_col: str = "trial_id",
+#     time_slice_col: str = "time_slice",
+#     response_time_col: str = "response_time",
+#     failure_col: str = "failure",
+#     tolerance: float = 0.20
+# ) -> TauResults:
+#     """
+#     Calculate all four tau time-share metrics:
+
+#         tau_u_rt:
+#             Percentage of time slices in which mean response time exceeds
+#             the response-time SLO.
+
+#         tau_o_rt:
+#             Percentage of time slices in which mean response time is below
+#             the response-time SLO.
+
+#         tau_u_fr:
+#             Percentage of time slices in which failure rate exceeds the
+#             failure-rate SLO.
+
+#         tau_o_fr:
+#             Percentage of time slices in which failure rate is below the
+#             failure-rate SLO.
+
+#     The input dataframe contains one row per request and must already assign
+#     each request to a fixed-duration time slice.
+
+#     For each time slice:
+
+#         RT_t = mean response time of requests in the slice
+
+#         FR_t = failed request rows / total request rows
+
+#     Since all time slices have equal duration, each tau metric is 100 times
+#     the mean of its corresponding zero-or-one indicator.
+
+#     Slices exactly equal to an SLO contribute zero to both the under- and
+#     over-SLO time shares, consistent with sgn(0) = 0.
+
+#     Parameters
+#     ----------
+#     requests_df:
+#         Request-level dataframe.
+
+#     slo_rt_ms:
+#         Response-time SLO in milliseconds.
+
+#     slo_fr:
+#         Failure-rate SLO expressed as a proportion. For example, 0.01 means
+#         a 1% failure-rate SLO.
+
+#     Returns
+#     -------
+#     TauResults
+#         time_slices:
+#             One row per autoscaler, trial, and time slice, including the
+#             calculated RT and FR values and indicator variables.
+
+#         trials:
+#             One row per autoscaler and trial containing the four tau values.
+
+#         autoscalers:
+#             Experiment-level mean, standard deviation, trial count, and
+#             standard error for each autoscaler.
+#     """
+#     if slo_rt_ms <= 0:
+#         raise ValueError("slo_rt_ms must be greater than zero.")
+
+#     if not 0 < slo_fr <= 1:
+#         raise ValueError("slo_fr must be greater than 0 and no greater than 1.")
+
+#     required_columns = {
+#         autoscaler_col,
+#         trial_col,
+#         time_slice_col,
+#         response_time_col,
+#         failure_col,
+#     }
+
+#     missing_columns = required_columns.difference(requests_df.columns)
+
+#     if missing_columns:
+#         raise ValueError(
+#             "The dataframe is missing required columns: "
+#             + ", ".join(sorted(missing_columns))
+#         )
+
+#     df = requests_df.copy()
+
+#     df[response_time_col] = pd.to_numeric(
+#         df[response_time_col],
+#         errors="coerce",
+#     )
+
+#     df[failure_col] = pd.to_numeric(
+#         df[failure_col],
+#         errors="coerce",
+#     )
+
+#     if df[response_time_col].isna().any():
+#         raise ValueError(
+#             f"Column {response_time_col!r} contains missing or nonnumeric values."
+#         )
+
+#     if df[failure_col].isna().any():
+#         raise ValueError(
+#             f"Column {failure_col!r} contains missing or nonnumeric values."
+#         )
+
+#     invalid_failure_values = ~df[failure_col].isin([0, 1])
+
+#     if invalid_failure_values.any():
+#         invalid_values = sorted(
+#             df.loc[invalid_failure_values, failure_col].unique().tolist()
+#         )
+#         raise ValueError(
+#             f"Column {failure_col!r} must contain only 0 and 1. "
+#             f"Invalid values: {invalid_values}"
+#         )
+
+#     group_columns = [
+#         autoscaler_col,
+#         trial_col,
+#         time_slice_col,
+#     ]
+
+#     # .size() counts all request rows, independently of missing values in
+#     # any particular measurement column.
+#     time_slices = (
+#         df.groupby(group_columns, observed=True, dropna=False)
+#         .agg(
+#             mean_response_time_ms=(response_time_col, "mean"),
+#             failures=(failure_col, "sum"),
+#             requests=(failure_col, "size"),
+#         )
+#         .reset_index()
+#     )
+
+#     time_slices["failure_rate"] = (
+#         time_slices["failures"] / time_slices["requests"]
+#     )
+
+#     # Equivalent to max(sgn(RT_t - SLO_RT), 0).
+#     time_slices["indicator_u_rt"] = (
+#         time_slices["mean_response_time_ms"] > (slo_rt_ms * (1.0 + tolerance))
+#     ).astype(np.int8)
+
+#     # Equivalent to max(sgn(SLO_RT - RT_t), 0).
+#     time_slices["indicator_o_rt"] = (
+#         time_slices["mean_response_time_ms"] < (slo_rt_ms * (1.0 - tolerance))
+#     ).astype(np.int8)
+
+#     # Equivalent to max(sgn(FR_t - SLO_FR), 0).
+#     time_slices["indicator_u_fr"] = (
+#         time_slices["failure_rate"] > (slo_fr * (1.0 + tolerance))
+#     ).astype(np.int8)
+
+#     # Equivalent to max(sgn(SLO_FR - FR_t), 0).
+#     time_slices["indicator_o_fr"] = (
+#         time_slices["failure_rate"] < (slo_fr * (1.0 - tolerance))
+#     ).astype(np.int8)
+
+#     trial_group_columns = [
+#         autoscaler_col,
+#         trial_col,
+#     ]
+
+#     trials = (
+#         time_slices
+#         .groupby(trial_group_columns, observed=True, dropna=False)
+#         .agg(
+#             tau_u_rt=("indicator_u_rt", lambda values: 100.0 * values.mean()),
+#             tau_o_rt=("indicator_o_rt", lambda values: 100.0 * values.mean()),
+#             tau_u_fr=("indicator_u_fr", lambda values: 100.0 * values.mean()),
+#             tau_o_fr=("indicator_o_fr", lambda values: 100.0 * values.mean()),
+#             time_slices=(time_slice_col, "size"),
+#             requests=("requests", "sum"),
+#         )
+#         .reset_index()
+#     )
+
+#     metric_columns = [
+#         "tau_u_rt",
+#         "tau_o_rt",
+#         "tau_u_fr",
+#         "tau_o_fr",
+#     ]
+
+#     autoscalers = (
+#         trials
+#         .groupby(autoscaler_col, observed=True, dropna=False)[metric_columns]
+#         .agg(["mean", "std", "count"])
+#     )
+
+#     autoscalers.columns = [
+#         f"{metric}_{statistic}"
+#         for metric, statistic in autoscalers.columns
+#     ]
+
+#     autoscalers = autoscalers.reset_index()
+
+#     for metric in metric_columns:
+#         autoscalers[f"{metric}_sem"] = (
+#             autoscalers[f"{metric}_std"]
+#             / np.sqrt(autoscalers[f"{metric}_count"])
+#         )
+
+#     return TauResults(
+#         time_slices=time_slices,
+#         trials=trials,
+#         autoscalers=autoscalers,
+#     )
+
+
 def calculate_tau_metrics(
     requests_df: pd.DataFrame,
     *,
@@ -650,41 +1228,46 @@ def calculate_tau_metrics(
     time_slice_col: str = "time_slice",
     response_time_col: str = "response_time",
     failure_col: str = "failure",
-    tolerance: float = 0.20
+    tolerance: float = 0.20,
 ) -> TauResults:
     """
     Calculate all four tau time-share metrics:
 
         tau_u_rt:
-            Percentage of time slices in which mean response time exceeds
-            the response-time SLO.
+            Percentage of time slices in which mean response time of
+            SUCCESSFUL requests exceeds the upper response-time threshold.
 
         tau_o_rt:
-            Percentage of time slices in which mean response time is below
-            the response-time SLO.
+            Percentage of time slices in which mean response time of
+            SUCCESSFUL requests is below the lower response-time threshold.
 
         tau_u_fr:
             Percentage of time slices in which failure rate exceeds the
-            failure-rate SLO.
+            upper failure-rate threshold.
 
         tau_o_fr:
             Percentage of time slices in which failure rate is below the
-            failure-rate SLO.
+            lower failure-rate threshold.
 
     The input dataframe contains one row per request and must already assign
     each request to a fixed-duration time slice.
 
     For each time slice:
 
-        RT_t = mean response time of requests in the slice
+        RT_t = mean response time of SUCCESSFUL requests in the slice
 
         FR_t = failed request rows / total request rows
 
+    Response-time calculations therefore exclude failed requests, while
+    failure-rate calculations include all requests.
+
+    The tolerance defines a neutral band around each SLO:
+
+        upper threshold = SLO * (1 + tolerance)
+        lower threshold = SLO * (1 - tolerance)
+
     Since all time slices have equal duration, each tau metric is 100 times
     the mean of its corresponding zero-or-one indicator.
-
-    Slices exactly equal to an SLO contribute zero to both the under- and
-    over-SLO time shares, consistent with sgn(0) = 0.
 
     Parameters
     ----------
@@ -698,12 +1281,15 @@ def calculate_tau_metrics(
         Failure-rate SLO expressed as a proportion. For example, 0.01 means
         a 1% failure-rate SLO.
 
+    tolerance:
+        Proportional tolerance around each SLO. For example, 0.20 creates
+        a +/-20% neutral band.
+
     Returns
     -------
     TauResults
         time_slices:
-            One row per autoscaler, trial, and time slice, including the
-            calculated RT and FR values and indicator variables.
+            One row per autoscaler, trial, and time slice.
 
         trials:
             One row per autoscaler and trial containing the four tau values.
@@ -712,11 +1298,19 @@ def calculate_tau_metrics(
             Experiment-level mean, standard deviation, trial count, and
             standard error for each autoscaler.
     """
+
     if slo_rt_ms <= 0:
         raise ValueError("slo_rt_ms must be greater than zero.")
 
     if not 0 < slo_fr <= 1:
-        raise ValueError("slo_fr must be greater than 0 and no greater than 1.")
+        raise ValueError(
+            "slo_fr must be greater than 0 and no greater than 1."
+        )
+
+    if not 0 <= tolerance < 1:
+        raise ValueError(
+            "tolerance must be greater than or equal to 0 and less than 1."
+        )
 
     required_columns = {
         autoscaler_col,
@@ -724,6 +1318,7 @@ def calculate_tau_metrics(
         time_slice_col,
         response_time_col,
         failure_col,
+        "status_code",
     }
 
     missing_columns = required_columns.difference(requests_df.columns)
@@ -735,6 +1330,19 @@ def calculate_tau_metrics(
         )
 
     df = requests_df.copy()
+
+    # ------------------------------------------------------------------
+    # Identify successful requests.
+    # ------------------------------------------------------------------
+
+    df["is_success"] = (
+        pd.to_numeric(df["status_code"], errors="coerce")
+        .between(200, 299)
+    )
+
+    # ------------------------------------------------------------------
+    # Validate/convert response time and failure indicator.
+    # ------------------------------------------------------------------
 
     df[response_time_col] = pd.to_numeric(
         df[response_time_col],
@@ -748,24 +1356,44 @@ def calculate_tau_metrics(
 
     if df[response_time_col].isna().any():
         raise ValueError(
-            f"Column {response_time_col!r} contains missing or nonnumeric values."
+            f"Column {response_time_col!r} contains missing "
+            "or nonnumeric values."
         )
 
     if df[failure_col].isna().any():
         raise ValueError(
-            f"Column {failure_col!r} contains missing or nonnumeric values."
+            f"Column {failure_col!r} contains missing "
+            "or nonnumeric values."
         )
 
     invalid_failure_values = ~df[failure_col].isin([0, 1])
 
     if invalid_failure_values.any():
         invalid_values = sorted(
-            df.loc[invalid_failure_values, failure_col].unique().tolist()
+            df.loc[
+                invalid_failure_values,
+                failure_col,
+            ].unique().tolist()
         )
+
         raise ValueError(
             f"Column {failure_col!r} must contain only 0 and 1. "
             f"Invalid values: {invalid_values}"
         )
+
+    # ------------------------------------------------------------------
+    # Response-time value used for RT metrics.
+    #
+    # Failed requests are set to NaN. Pandas mean() ignores NaN values,
+    # so only successful requests contribute to RT_t.
+    #
+    # Failed requests remain in df and therefore continue to contribute
+    # to the failure-rate calculation.
+    # ------------------------------------------------------------------
+
+    df["_successful_response_time"] = df[response_time_col].where(
+        df["is_success"]
+    )
 
     group_columns = [
         autoscaler_col,
@@ -773,41 +1401,88 @@ def calculate_tau_metrics(
         time_slice_col,
     ]
 
-    # .size() counts all request rows, independently of missing values in
-    # any particular measurement column.
+    # ------------------------------------------------------------------
+    # Calculate time-slice statistics.
+    #
+    # mean_response_time_ms:
+    #     Successful requests only.
+    #
+    # successful_requests:
+    #     Number of requests contributing to mean response time.
+    #
+    # failures / requests:
+    #     Calculated from ALL requests.
+    # ------------------------------------------------------------------
+
     time_slices = (
-        df.groupby(group_columns, observed=True, dropna=False)
+        df.groupby(
+            group_columns,
+            observed=True,
+            dropna=False,
+        )
         .agg(
-            mean_response_time_ms=(response_time_col, "mean"),
-            failures=(failure_col, "sum"),
-            requests=(failure_col, "size"),
+            mean_response_time_ms=(
+                "_successful_response_time",
+                "mean",
+            ),
+            successful_requests=(
+                "is_success",
+                "sum",
+            ),
+            failures=(
+                failure_col,
+                "sum",
+            ),
+            requests=(
+                failure_col,
+                "size",
+            ),
         )
         .reset_index()
     )
 
     time_slices["failure_rate"] = (
-        time_slices["failures"] / time_slices["requests"]
+        time_slices["failures"]
+        / time_slices["requests"]
     )
 
-    # Equivalent to max(sgn(RT_t - SLO_RT), 0).
+    # ------------------------------------------------------------------
+    # Calculate tolerance thresholds.
+    # ------------------------------------------------------------------
+
+    rt_upper_threshold = slo_rt_ms * (1.0 + tolerance)
+    rt_lower_threshold = slo_rt_ms * (1.0 - tolerance)
+
+    fr_upper_threshold = slo_fr * (1.0 + tolerance)
+    fr_lower_threshold = slo_fr * (1.0 - tolerance)
+
+    # ------------------------------------------------------------------
+    # Underprovisioning indicators.
+    # ------------------------------------------------------------------
+
     time_slices["indicator_u_rt"] = (
-        time_slices["mean_response_time_ms"] > (slo_rt_ms * (1.0 + tolerance))
+        time_slices["mean_response_time_ms"] > rt_upper_threshold
     ).astype(np.int8)
 
-    # Equivalent to max(sgn(SLO_RT - RT_t), 0).
-    time_slices["indicator_o_rt"] = (
-        time_slices["mean_response_time_ms"] < (slo_rt_ms * (1.0 - tolerance))
-    ).astype(np.int8)
-
-    # Equivalent to max(sgn(FR_t - SLO_FR), 0).
     time_slices["indicator_u_fr"] = (
-        time_slices["failure_rate"] > (slo_fr * (1.0 + tolerance))
+        time_slices["failure_rate"] > fr_upper_threshold
     ).astype(np.int8)
 
-    # Equivalent to max(sgn(SLO_FR - FR_t), 0).
-    time_slices["indicator_o_fr"] = (
-        time_slices["failure_rate"] < (slo_fr * (1.0 - tolerance))
+    # ------------------------------------------------------------------
+    # Overprovisioning indicators.
+    # ------------------------------------------------------------------
+
+    time_slices["indicator_o_rt"] = (
+        time_slices["mean_response_time_ms"] < rt_lower_threshold
     ).astype(np.int8)
+
+    time_slices["indicator_o_fr"] = (
+        time_slices["failure_rate"] < fr_lower_threshold
+    ).astype(np.int8)
+
+    # ------------------------------------------------------------------
+    # Trial-level tau metrics.
+    # ------------------------------------------------------------------
 
     trial_group_columns = [
         autoscaler_col,
@@ -816,14 +1491,44 @@ def calculate_tau_metrics(
 
     trials = (
         time_slices
-        .groupby(trial_group_columns, observed=True, dropna=False)
+        .groupby(
+            trial_group_columns,
+            observed=True,
+            dropna=False,
+        )
         .agg(
-            tau_u_rt=("indicator_u_rt", lambda values: 100.0 * values.mean()),
-            tau_o_rt=("indicator_o_rt", lambda values: 100.0 * values.mean()),
-            tau_u_fr=("indicator_u_fr", lambda values: 100.0 * values.mean()),
-            tau_o_fr=("indicator_o_fr", lambda values: 100.0 * values.mean()),
-            time_slices=(time_slice_col, "size"),
-            requests=("requests", "sum"),
+            tau_u_rt=(
+                "indicator_u_rt",
+                lambda values: 100.0 * values.mean(),
+            ),
+            tau_o_rt=(
+                "indicator_o_rt",
+                lambda values: 100.0 * values.mean(),
+            ),
+            tau_u_fr=(
+                "indicator_u_fr",
+                lambda values: 100.0 * values.mean(),
+            ),
+            tau_o_fr=(
+                "indicator_o_fr",
+                lambda values: 100.0 * values.mean(),
+            ),
+            time_slices=(
+                time_slice_col,
+                "size",
+            ),
+            requests=(
+                "requests",
+                "sum",
+            ),
+            successful_requests=(
+                "successful_requests",
+                "sum",
+            ),
+            failures=(
+                "failures",
+                "sum",
+            ),
         )
         .reset_index()
     )
@@ -835,9 +1540,17 @@ def calculate_tau_metrics(
         "tau_o_fr",
     ]
 
+    # ------------------------------------------------------------------
+    # Autoscaler-level summaries.
+    # ------------------------------------------------------------------
+
     autoscalers = (
         trials
-        .groupby(autoscaler_col, observed=True, dropna=False)[metric_columns]
+        .groupby(
+            autoscaler_col,
+            observed=True,
+            dropna=False,
+        )[metric_columns]
         .agg(["mean", "std", "count"])
     )
 
@@ -954,7 +1667,6 @@ def calculate_async_utilization_by_autoscaler(files, run_id, s3_bucket, earliest
     labels = ["idle", "processing"]
     utilization_df = None
     for metric, label in zip(metrics, labels):
-        print(metric, label)
         temp_df = get_merged_range_metric_df(files, run_id, s3_bucket, metric, label)
         if temp_df is None or len(temp_df) == 0:
             print(f"temp_df does not exist for metric: {metric}, label: {label}.")
@@ -1075,8 +1787,18 @@ def get_trial_start_and_end_times(files, s3_bucket, run_id, trial_id):
 
 
 def get_asynchronous_metrics(files, run_id, s3_bucket, earliest_start_time, latest_end_time,
-    l_max=5, l_target=5, n_min=0, u_target=0.50, gamma=0.50, omega=0.50, time_slice_seconds=15):
+    l_max=5, l_target=5, n_min=0, u_target=0.50, gamma=0.50, omega=0.50, time_slice_seconds=15,
+    log_df=None):
     """Calculate the asynchronous metrics for a given run."""
+
+    earliest_start_time -= datetime.timedelta(seconds=1)
+    latest_end_time += datetime.timedelta(seconds=time_slice_seconds)
+    # print(f"Earliest start time: {earliest_start_time}")
+    # print(f"Latest end time: {latest_end_time}")
+
+    # Get the file listing if files is None
+    if files is None:
+        files = get_s3_file_listing(s3_bucket, run_id)
     
     # Get the async processing time
     async_utilization, _ = calculate_async_utilization_by_autoscaler(files, run_id, s3_bucket, earliest_start_time, 
@@ -1085,6 +1807,8 @@ def get_asynchronous_metrics(files, run_id, s3_bucket, earliest_start_time, late
     # Get the lag dataframe
     lag_df = get_merged_range_metric_df(files, run_id, s3_bucket, "kafka_consumer_group_lag_sum_ratio", "lag")
     
+    # print(f"The earliest timestamp in lag_df is {lag_df.timestamp}")
+
     # Get the replicas dataframe
     n_df = get_merged_range_metric_df(files, run_id, s3_bucket, "kube_deployment_status_replicas-deployment", "replicas")
     
@@ -1103,10 +1827,9 @@ def get_asynchronous_metrics(files, run_id, s3_bucket, earliest_start_time, late
     
     # Mege lag_df and utilization on timestamp autoscaler, trial_id, and topic
     lag_df = lag_df.merge(async_utilization, on=["timestamp", "autoscaler", "trial_id", "topic"], suffixes=["_lag", "_utilization"])
-    print("Displaying lag_df")
-    display(lag_df)
     
     # Calculate interval_range from the ealiest to latest start time
+    
     time_slice_index = pd.interval_range(
         start=earliest_start_time, 
         end=latest_end_time,
@@ -1123,8 +1846,33 @@ def get_asynchronous_metrics(files, run_id, s3_bucket, earliest_start_time, late
         labels=time_slice_index[:],
     )
 
+    # if log_df is not None,
+    if log_df is not None:
+        log_df = log_df.copy()
+        # column start_time is a string in local time.  
+        # Create a new column "timestamp" with the time in datetime64[us, UTC]
+        log_df["timestamp"] = pd.to_datetime(log_df["start_time"], unit="s", utc=True).astype('datetime64[us, UTC]')
+        # add 4 hours
+        # log_df["timestamp"] = log_df["timestamp"] + pd.Timedelta(hours=4)
+        # add timeslice column using time_slice_index
+        log_df["time_slice"] = pd.cut(
+            log_df.timestamp, 
+            bins=time_slice_index, 
+            include_lowest=True
+        )
+        # aggregate (count) by time_slice
+        log_df = log_df.groupby(["time_slice"], observed=True).agg(requests=("timestamp", "count")).reset_index()
+        # merge with lag_df on time_slice
+        lag_df = lag_df.merge(log_df, on=["time_slice"], how="left")
+        # fill na on requests column with zero
+        lag_df["requests"] = lag_df["requests"].fillna(0)
+
+    # Weight lag by the inverse number of requests in the time slice
+    lag_df["lag"] = lag_df["lag"] / lag_df["requests"]
+
     # Add "theta_a_u" column
     lag_df["theta_a_u"] = (lag_df.lag - l_max).clip(lower=0)/l_max
+    # lag_df["theta_a_u"] = (lag_df.lag - l_max).clip(lower=0)/(l_max * lag_df.requests)
 
     # Add "tau_a_u" time-slice column
     lag_df["tau_a_u"] = np.where(lag_df.lag > l_max, 1, 0)
@@ -1153,6 +1901,8 @@ def get_asynchronous_metrics(files, run_id, s3_bucket, earliest_start_time, late
     # Add "tau_a_o" column
     lag_df["tau_a_o"] = lag_df["overprovisioned_ts"] * lag_df["lag_at_or_below_target"] * lag_df["replicas_above_minimum"]
 
+    
+      
     agg_df = (
         lag_df
         .groupby(["autoscaler"], observed=True, dropna=False)
@@ -1174,7 +1924,7 @@ def get_asynchronous_metrics(files, run_id, s3_bucket, earliest_start_time, late
         
     
     return lag_df, agg_df
-
+        
 
 def get_tsdb_snapshots(files):
     """Get the tsdb snapshots from the files."""
@@ -4046,6 +4796,7 @@ def calculate_weighted_synchronous_theta(df, earliest_start_time, latest_end_tim
     """Returns the theta value for the given dataframe."""
     df = df.copy()
     df = append_time_slice(df, earliest_start_time, latest_end_time, time_slice_seconds=time_slice_seconds)
+
     theta_results = calculate_theta_metrics(df, slo_rt_ms=slo_rt_ms, slo_fr=slo_fr)
     weighted_theta_results = add_weighted_theta(
         theta_results.autoscalers,
@@ -4055,10 +4806,7 @@ def calculate_weighted_synchronous_theta(df, earliest_start_time, latest_end_tim
     return weighted_theta_results, theta_results
 
 
-
-import re
-
-def latex_to_stacked_html(tex: str) -> str:
+def latex_to_stacked_html_old(tex: str) -> str:
     """
     Renders expressions like r'\theta^{RT}_{U}', r'\theta^{RT}', or r'\theta'
     tightly inline with balanced super/subscript vertical positioning.
@@ -4107,6 +4855,62 @@ def latex_to_stacked_html(tex: str) -> str:
         f'</span>'
     )
 
+
+def latex_to_stacked_html(tex: str) -> str:
+    """
+    Renders expressions like r'\theta^{RT}_{U}', r'\tau^{RT}',
+    r'\bar{C}_{CPU}', or r'\bar{C}_{MEM}' tightly inline.
+    """
+    tex = tex.strip()
+
+    # 1. Replace Greek letters
+    tex = tex.replace(r"\theta", "&#952;")
+    tex = tex.replace(r"\tau", "&#964;")
+
+    # 2. Replace \bar{...} or \overline{...} with an overline span
+    tex = re.sub(
+        r"\\(?:bar|overline)\{([^}]+)\}",
+        r'<span style="text-decoration: overline;">\1</span>',
+        tex
+    )
+
+    # 3. Match base (including HTML tags or entities) and optional sub/sup
+    pattern = (
+        r"^(<span[^>]*>.*?</span>|&#\d+;|[a-zA-Z])"
+        r"(?:(?:\^\{([^}]+)\}|_\{([^}]+)\})(?:_\{([^}]+)\}|\^\{([^}]+)\})?)?$"
+    )
+    match = re.match(pattern, tex)
+    if not match:
+        return tex
+
+    base = match.group(1)
+    sup = match.group(2) or match.group(5) or ""
+    sub = match.group(3) or match.group(4) or ""
+
+    # Case 1: Plain symbol / base only
+    if not sup and not sub:
+        return base
+
+    # Case 2: Superscript only
+    if sup and not sub:
+        return f'<span style="white-space:nowrap;">{base}<sup style="font-size:0.68em; line-height:0;">{sup}</sup></span>'
+
+    # Case 3: Subscript only
+    if sub and not sup:
+        return f'<span style="white-space:nowrap;">{base}<sub style="font-size:0.68em; line-height:0;">{sub}</sub></span>'
+
+    # Case 4: Vertically stacked super- and subscript
+    return (
+        f'<span style="display:inline-flex; align-items:center; white-space:nowrap;">'
+        f'{base}'
+        f'<span style="display:inline-grid; grid-template-rows:auto auto; '
+        f'font-size:0.62em; line-height:0.95; vertical-align:middle; '
+        f'margin-left:1.5px; position:relative; top:-0.18em; text-align:left;">'
+        f'<span>{sup}</span>'
+        f'<span>{sub}</span>'
+        f'</span>'
+        f'</span>'
+    )
 
 
 
@@ -4239,3 +5043,239 @@ def weighted_synchronous_tau_to_html(df):
     return html
 
 
+def weighted_asynchronous_metrics_df_to_html(df):
+    df = df.copy()
+
+    columns_order = [
+       "autoscaler", 
+       "lag_mean", 
+       "theta_a_u", 
+       "theta_a_o", 
+       "tau_a_u",
+       "tau_a_o", 
+       "theta_a", 
+       "tau_a"
+    ]
+    df = df[columns_order]
+    df.rename(columns={"autoscaler": "Autoscaler"}, inplace=True)
+    df.columns.name = None
+
+    # Column mapping dictionary
+    header_replacements = {
+        "lag_mean": "Avg. Lag",
+        "theta_a_u": latex_to_stacked_html(r"\theta^{A}_{U}"),
+        "theta_a_o": latex_to_stacked_html(r"\theta^{A}_{O}"),
+        "tau_a_u": latex_to_stacked_html(r"\tau^{A}_{U}"),
+        "tau_a_o": latex_to_stacked_html(r"\tau^{A}_{O}"),
+        "theta_a": latex_to_stacked_html(r"\theta^{A}"),
+        "tau_a": latex_to_stacked_html(r"\tau^{A}"),
+        
+    }
+
+    # Initialize Styler
+    style = df.style.format({col: "{:.3f}" for col in df.columns if col != "Autoscaler"})
+    
+    style = style.set_properties(**{"text-align": "center"})
+    style = style.set_table_styles(
+        [{"selector": "th", "props": [("text-align", "center")]}]
+    )
+    style = style.set_properties(
+        subset=["Autoscaler"], **{"text-transform": "uppercase"}
+    )
+    style = style.hide(axis="index")
+    style = style.set_table_attributes('class="data-table compact" border="0"')
+
+    html = style.to_html(escape=False)
+
+    # Perform all column name replacements
+    for original_col, formatted_col in header_replacements.items():
+        html = html.replace(original_col, formatted_col)
+
+    return html
+
+
+def calculate_c_metric(
+    s3_bucket, 
+    run_id, 
+    earliest_start_time, 
+    latest_end_time, 
+    time_slice_seconds, 
+    total_cpu,
+    total_memory,
+    alpha):
+
+    # Get list of S3 files
+    files = get_s3_file_listing(s3_bucket, run_id)
+    
+    # Pull CPU metrics
+    cpu_metric = "kube_pod_container_resource_requests-container,cpu"
+    cpu_column_label = "cores"
+    cpu_requests_df = get_merged_range_metric_df(files, run_id, s3_bucket, cpu_metric, cpu_column_label)
+    
+    # Pull Memory metrics
+    memory_metric = "kube_pod_container_resource_requests-container,memory"
+    memory_column_label = "bytes"
+    memory_requests_df = get_merged_range_metric_df(files, run_id, s3_bucket, memory_metric, memory_column_label)
+
+
+
+    c_bar_df = cpu_requests_df.merge(memory_requests_df, on=["timestamp", "autoscaler", "trial_id", "container"], suffixes=["_cpu", "_memory"])
+
+    # Convert timestamp to UTC 
+    c_bar_df["timestamp"] = pd.to_datetime(c_bar_df["timestamp"], unit="s", utc=True).astype('datetime64[us, UTC]')
+        
+
+    # Calculate interval_range from the ealiest to latest start time
+    time_slice_index = pd.interval_range(
+        start=earliest_start_time, 
+        end=latest_end_time,
+        freq=pd.Timedelta(seconds=time_slice_seconds),
+        name="time_slice",
+    )
+
+
+    # Assign each row to a time slice based on start_time
+    c_bar_df["time_slice"] = pd.cut(
+        c_bar_df.timestamp,
+        bins=time_slice_index,
+        include_lowest=True, 
+        labels=time_slice_index[:],
+    )
+
+    # display(c_bar_df[c_bar_df.container=="globeco-order-service"])
+
+    # Calculate the sum of cores and bytes for each time_slice, autoscaler, and trial_id
+    c_bar_df = c_bar_df.groupby(["time_slice", "autoscaler", "trial_id"]).agg(
+        cores=("cores", "sum"),
+        bytes=("bytes", "sum")
+    ).reset_index()
+
+    # Calculate the mean of the sum of cores and bytes for each autoscaler, and trial_id
+    c_bar_df = c_bar_df.groupby(["autoscaler", "trial_id"]).agg(
+        cores=("cores", "mean"),
+        bytes=("bytes", "mean")
+    ).reset_index()
+
+    
+    # Calculate the mean of cores and bytes for each autoscaler
+    c_bar_df = c_bar_df.groupby(["autoscaler"]).agg(
+        c_bar_cpu=("cores", "mean"),
+        c_bar_mem=("bytes", "mean")
+    ).reset_index()
+
+    c_bar_df["c_bar_cpu"] /= total_cpu 
+    c_bar_df["c_bar_mem"] /= total_memory 
+
+    c_bar_df["c_bar_cpu"] *= 100 
+    c_bar_df["c_bar_mem"] *= 100 
+
+    # Convert bytes to GB
+    c_bar_df["c_bar_mem"] /= (1024**3)
+
+    # Calulate c_bar
+    c_bar_df["c_bar"] = alpha * c_bar_df["c_bar_cpu"] + (1 - alpha) * c_bar_df["c_bar_mem"]
+
+    return c_bar_df
+
+
+def cost_metrics_df_to_html(df):
+    df = df.copy()
+
+    columns_order = [
+       "autoscaler", 
+       "c_bar_cpu", 
+       "c_bar_mem", 
+       "c_bar",
+    ]
+    df = df[columns_order]
+    df.rename(columns={"autoscaler": "Autoscaler"}, inplace=True)
+    df.columns.name = None
+
+    # Column mapping dictionary
+    header_replacements = {
+    "c_bar_cpu": latex_to_stacked_html(r"\bar{C}_{CPU}"),
+    "c_bar_mem": latex_to_stacked_html(r"\bar{C}_{MEM}"),
+    "c_bar": latex_to_stacked_html(r"\bar{C}"),
+    }
+
+
+    # Initialize Styler
+    style = df.style.format({col: "{:.3f}" for col in df.columns if col != "Autoscaler"})
+    
+    style = style.set_properties(**{"text-align": "center"})
+    style = style.set_table_styles(
+        [{"selector": "th", "props": [("text-align", "center")]}]
+    )
+    style = style.set_properties(
+        subset=["Autoscaler"], **{"text-transform": "uppercase"}
+    )
+    style = style.hide(axis="index")
+    style = style.set_table_attributes('class="data-table compact" border="0"')
+
+    html = style.to_html(escape=False)
+
+    # Perform all column name replacements
+    for original_col, formatted_col in header_replacements.items():
+        html = html.replace(original_col, formatted_col)
+
+    return html
+
+
+def summary_df_to_html(df):
+    df = df.copy()
+
+    columns_order = [
+       "autoscaler", 
+       "theta_mean", 
+       "tau_mean", 
+       "theta_a",
+       "tau_a",
+       "&zeta;",
+       "c_bar",
+    ]
+
+    df = df[columns_order]
+    df.rename(columns={"autoscaler": "Autoscaler"}, inplace=True)
+    df.columns.name = None
+
+
+    # summary_df = summary_df.rename(columns={
+    #     "theta_mean": "$\\bar{\\theta}^{S}$",
+    #     "tau_mean": "$\\bar{\\tau}^{S}$",
+    #     "theta_a": "$\\theta^{A}$",
+    #     "tau_a": "$\\tau^{A}$",
+    #     "c_bar": "$\\bar{C}$",
+    # })
+
+    # Column mapping dictionary
+    header_replacements = {
+        "theta_mean": latex_to_stacked_html(r"\bar{\theta}^{S}"),
+        "tau_mean": latex_to_stacked_html(r"\bar{\tau}^{S}"),
+        "theta_a": latex_to_stacked_html(r"\theta^{A}"),
+        "tau_a": latex_to_stacked_html(r"\tau^{A}"),
+        # "&zeta;": latex_to_stacked_html(r"\zeta"),
+        "c_bar": latex_to_stacked_html(r"\bar{C}"),
+
+    }
+
+
+    # Initialize Styler
+    style = df.style.format({col: "{:.3f}" for col in df.columns if col != "Autoscaler"})
+    
+    style = style.set_properties(**{"text-align": "center"})
+    style = style.set_table_styles(
+        [{"selector": "th", "props": [("text-align", "center")]}]
+    )
+    style = style.set_properties(
+        subset=["Autoscaler"], **{"text-transform": "uppercase"}
+    )
+    style = style.hide(axis="index")
+    style = style.set_table_attributes('class="data-table compact" border="0"')
+
+    html = style.to_html(escape=False)
+
+    # Perform all column name replacements
+    for original_col, formatted_col in header_replacements.items():
+        html = html.replace(original_col, formatted_col)
+
+    return html

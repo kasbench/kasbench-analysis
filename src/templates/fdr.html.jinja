@@ -96,5 +96,20 @@
   {{ tau_table_html | safe }}
   </div>
  
+  <h3>Asynchronous Metrics (&theta;<sup>A</sup> and &tau;<sup>A</sup>) by Autoscaler</h3>
+  <div class="table-wrap">
+  {{ asynchronous_metrics_table_html | safe }}
+  </div>
+
+  <h3>Cost Metrics by Autoscaler</h3>
+  <div class="table-wrap">
+  {{ cost_metrics_table_html | safe }}
+  </div>
+
+  <h3>Summary Results by Autoscaler</h3>
+  <div class="table-wrap">
+  {{ summary_table_html | safe }}
+  </div>
+
 </body>
 </html>
