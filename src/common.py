@@ -1786,7 +1786,7 @@ def get_trial_start_and_end_times(files, s3_bucket, run_id, trial_id):
 
 
 
-def get_asynchronous_metrics(files, run_id, s3_bucket, earliest_start_time, latest_end_time,
+def get_asynchronous_metrics_old(files, run_id, s3_bucket, earliest_start_time, latest_end_time,
     l_max=5, l_target=5, n_min=0, u_target=0.50, gamma=0.50, omega=0.50, time_slice_seconds=15,
     log_df=None):
     """Calculate the asynchronous metrics for a given run."""
@@ -1867,9 +1867,7 @@ def get_asynchronous_metrics(files, run_id, s3_bucket, earliest_start_time, late
         # fill na on requests column with zero
         lag_df["requests"] = lag_df["requests"].fillna(0)
 
-    # Weight lag by the inverse number of requests in the time slice
-    lag_df["lag"] = lag_df["lag"] / lag_df["requests"]
-
+   
     # Add "theta_a_u" column
     lag_df["theta_a_u"] = (lag_df.lag - l_max).clip(lower=0)/l_max
     # lag_df["theta_a_u"] = (lag_df.lag - l_max).clip(lower=0)/(l_max * lag_df.requests)
@@ -1918,6 +1916,167 @@ def get_asynchronous_metrics(files, run_id, s3_bucket, earliest_start_time, late
 
     agg_df
 
+    agg_df["theta_a"] =  gamma * agg_df.theta_a_u + (1 - gamma) * agg_df.theta_a_o
+    agg_df["tau_a"] =  omega * agg_df.tau_a_u + (1 - omega) * agg_df.tau_a_o
+    agg_df
+        
+    
+    return lag_df, agg_df
+
+
+def get_asynchronous_metrics(files, run_id, s3_bucket, earliest_start_time, latest_end_time,
+    l_max=5, l_target=5, n_min=0, u_target=0.50, gamma=0.50, omega=0.50, time_slice_seconds=15, w_max=120,
+    arrival_rate_df=None, tolerance=0.20):
+    """Calculate the asynchronous metrics for a given run."""
+
+    earliest_start_time -= datetime.timedelta(seconds=1)
+    latest_end_time += datetime.timedelta(seconds=time_slice_seconds)
+    
+    # Get the file listing if files is None
+    if files is None:
+        files = get_s3_file_listing(s3_bucket, run_id)
+    
+    # Get the async processing time
+    async_utilization, _ = calculate_async_utilization_by_autoscaler(files, run_id, s3_bucket, earliest_start_time, 
+        latest_end_time, time_slice_seconds=time_slice_seconds)
+
+    
+    # Get the lag dataframe
+    lag_df = get_merged_range_metric_df(files, run_id, s3_bucket, "kafka_consumer_group_lag_sum_ratio", "lag")
+
+    
+    # Get the replicas dataframe
+    n_df = get_merged_range_metric_df(files, run_id, s3_bucket, "kube_deployment_status_replicas-deployment", "replicas")
+    
+    # Filter columns
+    lag_df = lag_df[['timestamp', 'topic', 'autoscaler','trial_id', 'lag']]
+    n_df = n_df[['timestamp', 'autoscaler','trial_id', 'replicas', 'deployment']]
+    
+    # Add column "deployment" to lag_df
+    lag_df["deployment"] = np.where(lag_df.topic == "orders", "globeco-fix-engine", "globeco-confirmation-service")
+    
+    # Merge lag and n dataframes
+    lag_df = lag_df.merge(n_df, on=["timestamp", "autoscaler", "trial_id", "deployment"], suffixes=["_lag", "_n"])
+    
+    # Convert timestamp to UTC 
+    lag_df["timestamp"] = pd.to_datetime(lag_df["timestamp"], unit="s", utc=True).astype('datetime64[us, UTC]')
+    
+    
+    # Calculate interval_range from the ealiest to latest start time
+    time_slice_index = pd.interval_range(
+        start=earliest_start_time, 
+        end=latest_end_time,
+        freq=pd.Timedelta(seconds=time_slice_seconds),
+        name="time_slice",
+    )
+
+
+    # Assign each row to a time slice based on start_time
+    lag_df["time_slice"] = pd.cut(
+        lag_df.timestamp,
+        bins=time_slice_index,
+        include_lowest=True, 
+        labels=time_slice_index[:],
+    )
+
+    # merge lag_df and async_utilization[["time_slice", "u_t"]] on time_slice
+    lag_df = lag_df.merge(async_utilization, on=["time_slice", "autoscaler", "trial_id", "topic"], suffixes=["_lag", "_utilization"])
+
+    # copy the arrival rate
+    arrival_rate_df = arrival_rate_df.copy()
+
+    # make column index a timezone aware datetime colum
+    arrival_rate_df["timestamp"] = pd.to_datetime(arrival_rate_df.index, unit="s", utc=True).astype('datetime64[us, UTC]')
+    
+    # add timeslice column using time_slice_index
+    arrival_rate_df["time_slice"] = pd.cut(
+        arrival_rate_df.timestamp, 
+        bins=time_slice_index, 
+        include_lowest=True
+    )
+    # aggregate (count) by time_slice
+    arrival_rate_df = arrival_rate_df.groupby(["time_slice"], observed=True).agg(arrival_rate=("value", "mean")).reset_index()
+    
+    # merge with lag_df on time_slice
+    lag_df = lag_df.merge(arrival_rate_df, on=["time_slice"], how="left")
+    
+    # fill na on requests column with zero
+    lag_df["arrival_rate"] = lag_df["arrival_rate"].fillna(0.0001)
+
+    # Calculate w_t
+    lag_df["w_t"] = lag_df.lag / lag_df.arrival_rate
+    # if lag_df["w_t"] is infinite, replace with 0
+    lag_df["w_t"] = lag_df["w_t"].replace([np.inf, -np.inf], 0)
+    lag_df["w_t"] = lag_df["w_t"].fillna(0)
+
+    # Add "theta_a_u" column
+    # lag_df["theta_a_u"] = (lag_df.arrival_rate - lag_df.arrival_rate*w_max).clip(lower=0)/(lag_df.arrival_rate*w_max)
+    lag_df["theta_a_u"] = (lag_df.w_t - w_max).clip(lower=0)/w_max
+    
+    # Add "tau_a_u" time-slice column
+    lag_df["tau_a_u"] = np.where(lag_df.w_t > w_max * (1.0 + tolerance), 1, 0)
+
+    # Add overprovisioned time-slice column
+    lag_df["overprovisioned_ts"] = np.where(lag_df.lag == 0, 1, 0)
+
+    # Add "weight_at_or_below_max" column (ones)
+    lag_df["weight_at_or_below_max"] = np.where(lag_df.w_t <= w_max * (1.0 + tolerance), 1, 0)
+    lag_df["lag_at_or_below_target"] = np.where(lag_df.lag <= l_target, 1, 0)
+
+    # Add "replicas_above_minimum" column (ones)
+    lag_df["replicas_above_minimum"] = np.where(lag_df.replicas > n_min, 1, 0)
+
+    # Add "overprovisioned_ratio" column
+    lag_df["overprovisioned_ratio"] = np.maximum(u_target - lag_df.u_t, 0)/u_target
+
+    # Add "theta_a_o" column
+    lag_df["theta_a_o"] = lag_df["overprovisioned_ratio"] * lag_df["weight_at_or_below_max"] * lag_df["replicas_above_minimum"]
+
+    # Add "underutilization" column (ones)
+    lag_df["underutilized"] = np.where(lag_df.u_t < u_target  * (1.0 - tolerance), 1, 0)
+
+    # Add "lag_under_target" column (ones
+    lag_df["lag_under_target"] = np.where(lag_df.lag <= l_target, 1, 0)
+
+    # Add "weight_below_target"
+    lag_df["weight_below_target"] = np.where(lag_df.w_t <= w_max * (1.0 - tolerance), 1, 0)
+
+    # Add "tau_a_o" column
+    lag_df["tau_a_o"] = lag_df["underutilized"] * lag_df["weight_below_target"] * lag_df["replicas_above_minimum"]
+
+      
+    agg_df = (
+        lag_df
+        .groupby(["autoscaler", "trial_id"], observed=True, dropna=False)
+        .agg(
+            lag_mean=("lag","mean"),
+            arrival_rate_mean=("arrival_rate", "mean"),
+            w_mean=("w_t", "mean"),
+            theta_a_u= ("theta_a_u", lambda values: 100.0 * values.mean()),
+            theta_a_o= ("theta_a_o", lambda values: 100.0 * values.mean()),
+            tau_a_u = ("tau_a_u", lambda values: 100.0 * values.mean()),
+            tau_a_o = ("tau_a_o", lambda values: 100.0 * values.mean()),
+        )
+        .reset_index()
+    )
+
+    # roll up to the autoscaler level
+    agg_df = (
+        agg_df
+        .groupby(["autoscaler"], observed=True, dropna=False)
+        .agg(
+            lag_mean=("lag_mean", "mean"),
+            arrival_rate_mean=("arrival_rate_mean", "mean"),
+            w_mean=("w_mean", "mean"),
+            theta_a_u= ("theta_a_u", "mean"),
+            theta_a_o= ("theta_a_o", "mean"),
+            tau_a_u = ("tau_a_u", "mean"),
+            tau_a_o = ("tau_a_o", "mean"),
+        )
+        .reset_index()
+    )
+
+    
     agg_df["theta_a"] =  gamma * agg_df.theta_a_u + (1 - gamma) * agg_df.theta_a_o
     agg_df["tau_a"] =  omega * agg_df.tau_a_u + (1 - omega) * agg_df.tau_a_o
     agg_df
