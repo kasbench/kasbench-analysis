@@ -604,15 +604,14 @@ def calculate_theta_metrics(
     time_slice_col: str = "time_slice",
     response_time_col: str = "response_time",
     failure_col: str = "failure",
+    k: int = 5,
 ) -> ThetaResults:
     """
-    Calculate all four theta metrics:
+    Calculate both theta metrics:
 
-        theta_u_rt: response time above SLO
-        theta_o_rt: response time below SLO
-        theta_u_fr: failure rate above SLO
-        theta_o_fr: failure rate below SLO
-
+        theta_rt: response time above SLO
+        theta_fr: failure rate above SLO
+        
     The input dataframe contains one row per request and is already assigned
     to fixed-duration time slices.
 
@@ -809,8 +808,10 @@ def calculate_theta_metrics(
             - slo_rt_ms
         )
         .clip(lower=0)
-        / slo_rt_ms
+        / slo_rt_ms * (k - 1)
     )
+
+    time_slices["normalized_u_rt"] = np.minimum(time_slices["normalized_u_rt"], 1)
 
     time_slices["normalized_u_fr"] = (
         (
@@ -818,31 +819,12 @@ def calculate_theta_metrics(
             - slo_fr
         )
         .clip(lower=0)
-        / slo_fr
+        / slo_fr * (k - 1)
     )
 
-    # ------------------------------------------------------------------
-    # Overprovisioning: observed result is better than the SLO.
-    # ------------------------------------------------------------------
+    time_slices["normalized_u_fr"] = np.minimum(time_slices["normalized_u_fr"], 1)
 
-    time_slices["normalized_o_rt"] = (
-        (
-            slo_rt_ms
-            - time_slices["mean_response_time_ms"]
-        )
-        .clip(lower=0)
-        / slo_rt_ms
-    )
-
-    time_slices["normalized_o_fr"] = (
-        (
-            slo_fr
-            - time_slices["failure_rate"]
-        )
-        .clip(lower=0)
-        / slo_fr
-    )
-
+   
     # ------------------------------------------------------------------
     # Trial-level theta metrics.
     # ------------------------------------------------------------------
@@ -860,20 +842,12 @@ def calculate_theta_metrics(
             dropna=False,
         )
         .agg(
-            theta_u_rt=(
+            theta_rt=(
                 "normalized_u_rt",
                 lambda values: 100.0 * values.mean(),
             ),
-            theta_o_rt=(
-                "normalized_o_rt",
-                lambda values: 100.0 * values.mean(),
-            ),
-            theta_u_fr=(
+            theta_fr=(
                 "normalized_u_fr",
-                lambda values: 100.0 * values.mean(),
-            ),
-            theta_o_fr=(
-                "normalized_o_fr",
                 lambda values: 100.0 * values.mean(),
             ),
             time_slices=(
@@ -897,10 +871,8 @@ def calculate_theta_metrics(
     )
 
     metric_columns = [
-        "theta_u_rt",
-        "theta_o_rt",
-        "theta_u_fr",
-        "theta_o_fr",
+        "theta_rt",
+        "theta_fr",
     ]
 
     # ------------------------------------------------------------------
@@ -972,18 +944,18 @@ def append_time_slice(df, earliest_start_time, latest_end_time, time_slice_secon
     return df
 
 
-def add_weighted_theta(summary_df_by_autoscaler, gamma=0.50, omega=0.50):
+def add_weighted_theta(summary_df_by_autoscaler, alpha=0.50):
     """Add weighted theta metrics to the summary dataframe."""
 
     # Make a copy of the dataframe
     summary_df_by_autoscaler = summary_df_by_autoscaler.copy()
 
-    # Weight over and under provisioning by gamma
-    summary_df_by_autoscaler["theta_rt_mean"] = gamma * summary_df_by_autoscaler["theta_u_rt_mean"] + (1 - gamma) * summary_df_by_autoscaler["theta_o_rt_mean"]
-    summary_df_by_autoscaler["theta_fr_mean"] = gamma * summary_df_by_autoscaler["theta_u_fr_mean"] + (1 - gamma) * summary_df_by_autoscaler["theta_o_fr_mean"]
+    # # Weight over and under provisioning by gamma
+    # summary_df_by_autoscaler["theta_rt_mean"] = gamma * summary_df_by_autoscaler["theta_u_rt_mean"] + (1 - gamma) * summary_df_by_autoscaler["theta_o_rt_mean"]
+    # summary_df_by_autoscaler["theta_fr_mean"] = gamma * summary_df_by_autoscaler["theta_u_fr_mean"] + (1 - gamma) * summary_df_by_autoscaler["theta_o_fr_mean"]
     
     # Weight response time and failure rate by omega
-    summary_df_by_autoscaler["theta_mean"] = omega * summary_df_by_autoscaler["theta_rt_mean"] + (1 - omega) * summary_df_by_autoscaler["theta_fr_mean"]
+    summary_df_by_autoscaler["theta_mean"] = alpha * summary_df_by_autoscaler["theta_rt_mean"] + (1 - alpha) * summary_df_by_autoscaler["theta_fr_mean"]
     return summary_df_by_autoscaler
 
 
@@ -1924,7 +1896,7 @@ def get_asynchronous_metrics_old(files, run_id, s3_bucket, earliest_start_time, 
     return lag_df, agg_df
 
 
-def get_asynchronous_metrics(files, run_id, s3_bucket, earliest_start_time, latest_end_time,
+def get_asynchronous_metrics_old(files, run_id, s3_bucket, earliest_start_time, latest_end_time,
     l_max=5, l_target=5, n_min=0, u_target=0.50, gamma=0.50, omega=0.50, time_slice_seconds=15, w_max=120,
     arrival_rate_df=None, tolerance=0.20):
     """Calculate the asynchronous metrics for a given run."""
@@ -2001,7 +1973,7 @@ def get_asynchronous_metrics(files, run_id, s3_bucket, earliest_start_time, late
     lag_df = lag_df.merge(arrival_rate_df, on=["time_slice"], how="left")
     
     # fill na on requests column with zero
-    lag_df["arrival_rate"] = lag_df["arrival_rate"].fillna(0.0001)
+    lag_df["arrival_rate"] = lag_df["arrival_rate"].fillna(0)
 
     # Calculate w_t
     lag_df["w_t"] = lag_df.lag / lag_df.arrival_rate
@@ -2081,6 +2053,127 @@ def get_asynchronous_metrics(files, run_id, s3_bucket, earliest_start_time, late
     agg_df["tau_a"] =  omega * agg_df.tau_a_u + (1 - omega) * agg_df.tau_a_o
     agg_df
         
+    
+    return lag_df, agg_df
+        
+def get_asynchronous_metrics(files, run_id, s3_bucket, earliest_start_time, latest_end_time,
+    time_slice_seconds=15, w_max=120, arrival_rate_df=None, tolerance=0.20, k=5):
+    """Calculate the asynchronous metrics for a given run."""
+
+    earliest_start_time -= datetime.timedelta(seconds=1)
+    latest_end_time += datetime.timedelta(seconds=time_slice_seconds)
+    
+    # Get the file listing if files is None
+    if files is None:
+        files = get_s3_file_listing(s3_bucket, run_id)
+    
+    # Get the lag dataframe
+    lag_df = get_merged_range_metric_df(files, run_id, s3_bucket, "kafka_consumer_group_lag_sum_ratio", "lag")
+ 
+    # Filter columns
+    lag_df = lag_df[['timestamp', 'topic', 'autoscaler','trial_id', 'lag']]
+    
+    # Add column "deployment" to lag_df
+    lag_df["deployment"] = np.where(lag_df.topic == "orders", "globeco-fix-engine", "globeco-confirmation-service")
+        
+    # Convert timestamp to UTC 
+    lag_df["timestamp"] = pd.to_datetime(lag_df["timestamp"], unit="s", utc=True).astype('datetime64[us, UTC]')
+    
+    # Calculate interval_range from the ealiest to latest start time
+    time_slice_index = pd.interval_range(
+        start=earliest_start_time, 
+        end=latest_end_time,
+        freq=pd.Timedelta(seconds=time_slice_seconds),
+        name="time_slice",
+    )
+
+    # Assign each row to a time slice based on start_time
+    lag_df["time_slice"] = pd.cut(
+        lag_df.timestamp,
+        bins=time_slice_index,
+        include_lowest=True, 
+        labels=time_slice_index[:],
+    )
+
+    # copy the arrival rate
+    arrival_rate_df = arrival_rate_df.copy()
+
+    # make column index a timezone aware datetime colum
+    arrival_rate_df["timestamp"] = pd.to_datetime(arrival_rate_df.index, unit="s", utc=True).astype('datetime64[us, UTC]')
+    
+    # add timeslice column using time_slice_index
+    arrival_rate_df["time_slice"] = pd.cut(
+        arrival_rate_df.timestamp, 
+        bins=time_slice_index, 
+        include_lowest=True
+    )
+
+    # aggregate (count) by time_slice
+    arrival_rate_df = arrival_rate_df.groupby(["time_slice"], observed=True).agg(arrival_rate=("value", "mean")).reset_index()
+    
+    # merge with lag_df on time_slice
+    lag_df = lag_df.merge(arrival_rate_df, on=["time_slice"], how="left")
+    
+    # fill na on requests column with zero
+    lag_df["arrival_rate"] = lag_df["arrival_rate"].fillna(0)
+
+    lag_df["lambda_star"] = lag_df["arrival_rate"]
+    # Iterate through the lag_df dataframe and calculate the value of lambda_star
+    lambda_star_col = lag_df.columns.get_loc("lambda_star")
+    lag_col = lag_df.columns.get_loc("lag")
+    
+    for i in range(k, len(lag_df)):
+        # if lambda_star is greater than 0, keep it
+        if lag_df.iloc[i, lambda_star_col] > 0:
+            continue
+        # if both lambda_star and lag are zero, keep it
+        if lag_df.iloc[i, lambda_star_col] == 0 and lag_df.iloc[i, lag_col] == 0:
+            continue
+        # otherwise, set lambda_star to the previous value (carry forward for calculation of work)
+        lag_df.iloc[i, lag_df.columns.get_loc("lambda_star")] = (
+            lag_df.iloc[i-1, lambda_star_col]
+        )
+
+    # Calculate w_t
+    lag_df["w_t"] = lag_df.lag / lag_df.lambda_star
+
+    # if lag_df["w_t"] is infinite, replace with 0
+    lag_df["w_t"] = lag_df["w_t"].replace([np.inf, -np.inf], 0)
+    lag_df["w_t"] = lag_df["w_t"].fillna(0)
+
+    # Add "theta_a" column
+    lag_df["theta_a"] = np.minimum((lag_df.w_t - w_max).clip(lower=0)/(k - 1) * w_max   , 1)
+    
+    # Add "tau_a" time-slice column
+    lag_df["tau_a"] = np.where(lag_df.w_t > w_max * (1.0 + tolerance), 1, 0)
+  
+    agg_df = (
+        lag_df
+        .groupby(["autoscaler", "trial_id"], observed=True, dropna=False)
+        .agg(
+            lag_mean=("lag","mean"),
+            arrival_rate_mean=("arrival_rate", "mean"),
+            w_mean=("w_t", "mean"),
+            theta_a= ("theta_a", lambda values: 100.0 * values.mean()),
+            tau_a = ("tau_a", lambda values: 100.0 * values.mean()),
+        )
+        .reset_index()
+    )
+
+    # roll up to the autoscaler level
+    agg_df = (
+        agg_df
+        .groupby(["autoscaler"], observed=True, dropna=False)
+        .agg(
+            lag_mean=("lag_mean", "mean"),
+            arrival_rate_mean=("arrival_rate_mean", "mean"),
+            w_mean=("w_mean", "mean"),
+            theta_a= ("theta_a", "mean"),
+            tau_a = ("tau_a", "mean"),
+        )
+        .reset_index()
+    )
+
     
     return lag_df, agg_df
         
@@ -4951,16 +5044,20 @@ def autoscaler_summary_df_to_html(autoscaler_summary_df):
 
 
 def calculate_weighted_synchronous_theta(df, earliest_start_time, latest_end_time, slo_rt_ms=100, 
-        slo_fr=0.01, gamma=0.50, omega=0.50, time_slice_seconds=30):
+        slo_fr=0.01, alpha=0.50, time_slice_seconds=30, k=5):
     """Returns the theta value for the given dataframe."""
+    
+    earliest_start_time -= datetime.timedelta(seconds=1)
+    latest_end_time += datetime.timedelta(seconds=time_slice_seconds)
+    
     df = df.copy()
     df = append_time_slice(df, earliest_start_time, latest_end_time, time_slice_seconds=time_slice_seconds)
 
-    theta_results = calculate_theta_metrics(df, slo_rt_ms=slo_rt_ms, slo_fr=slo_fr)
+    theta_results = calculate_theta_metrics(df, slo_rt_ms=slo_rt_ms, slo_fr=slo_fr, k=k)
+    
     weighted_theta_results = add_weighted_theta(
         theta_results.autoscalers,
-        gamma=gamma,
-        omega=omega,
+        alpha=alpha,
     )
     return weighted_theta_results, theta_results
 
@@ -5078,10 +5175,6 @@ def weighted_synchronous_theta_to_html(df):
 
     columns_order = [
         "autoscaler",
-        "theta_u_rt_mean", 
-        "theta_o_rt_mean", 
-        "theta_u_fr_mean", 
-        "theta_o_fr_mean",
         "theta_rt_mean", 
         "theta_fr_mean", 
         "theta_mean"
@@ -5092,10 +5185,6 @@ def weighted_synchronous_theta_to_html(df):
 
     # Column mapping dictionary
     header_replacements = {
-        "theta_u_rt_mean": latex_to_stacked_html(r"\theta^{RT}_{U}"),
-        "theta_o_rt_mean": latex_to_stacked_html(r"\theta^{RT}_{O}"),
-        "theta_u_fr_mean": latex_to_stacked_html(r"\theta^{FR}_{U}"),
-        "theta_o_fr_mean": latex_to_stacked_html(r"\theta^{FR}_{O}"),
         "theta_rt_mean": latex_to_stacked_html(r"\theta^{RT}"),
         "theta_fr_mean": latex_to_stacked_html(r"\theta^{FR}"),
         "theta_mean": latex_to_stacked_html(r"\theta^{S}"),
