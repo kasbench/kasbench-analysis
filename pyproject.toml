@@ -11,6 +11,7 @@ dependencies = [
     "latex2mathml>=3.81.1",
     "matplotlib>=3.11.1",
     "pandas>=3.0.5",
+    "playwright>=1.63.0",
     "prometheus-api-client>=0.7.2",
     "pyaml>=26.7.0",
     "pyperclip>=1.11.0",

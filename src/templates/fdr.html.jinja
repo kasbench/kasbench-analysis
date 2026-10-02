@@ -3,6 +3,7 @@
 <head>
   <meta charset="utf-8">
   <title>{{ title }}</title>
+  <link rel="stylesheet" href="../style.css">
 </head>
 <body>
 
@@ -10,10 +11,78 @@
   
   <h2>Preamble</h2>
 
-  <p class="body">This report documents the results obtained from an execution of the KASBench Kubernetes 
-  Autoscaling Benchmark.  
+  <p class="body">This Full Disclosure Report (FDR) documents the results obtained from a single execution of the Kubernetes 
+  Autoscaling Benchmark (KASBench) conducted from {{ start_date }} to {{ end_date }}.  
+  In this evaluation, the following autoscaler configurations were tested:
+  </p>
+
+  <ul>
+  {% for item in autoscaler_list %}
+      <li>{{ item }}</li>
+  {% endfor %}
+  </ul>
+
 
   <p>
+  The purpose of this report is to completely document the benchmark environment, execution procedures, system
+  configuration, and observed results of a full KASBench execution to enable independent verification and
+  reproduction.</p>
+
+  <p class="body">
+  KASBench is a comparative benchmark intended to evaluate Kubernetes autoscaling systems under controlled workloads
+  and documented conditions.  It measures autoscaler performance using five metrics  
+    ({{- theta_s -}}, {{ theta_a -}}, {{ tau_s -}}, {{ tau_a -}}, and {{ bar_c -}})
+  and three composite scores
+    ({{- d_s -}}, {{ d_a -}}, and {{ zeta -}}). 
+  These metrics and composite scores measure deviation from the ideal, and are in the range 0 to 100 inclusive.  
+  </p>
+
+  <p class="body">
+  <strong>Synchronous underprovisioning penalty ({{-theta_s-}})</strong> quantifies the mean deviation above a pre-determined service level objective 
+  (SLO) for synchronous requests initiated by a synthetic load generator over the benchmark period.
+  Results are calculated as a percentage in the range 0 to 100, inclusive, using an upper bound of {{ k_word -}}-times the SLO.
+  Sub-metrics for response-time ({{-theta_rt_s-}}) and failure-rate ({{-theta_fr_s-}}) are blended to calculate {{-theta_s-}}.
+  </p>
+
+  <p class="body">
+  <strong>Synchronous underprovisioned time slices ({{-tau_s-}})</strong> measures the percentage of {{ time_slice_seconds -}}-second
+  time slices during which requests exceed the SLO by more than {{ tolerance_percent -}}%.  It is calculated by blending
+  the sub-metrics for response-time ({{-tau_rt_s-}}) and failure-rate ({{-tau_fr_s-}}).
+  </p>
+
+  <p class="body">
+  
+
+
+  </p>
+
+  <p class="body">
+  </p>
+
+  <p class="body">
+  </p>
+
+  <p class="body">
+  </p>
+
+  <p class="body">
+  </p>
+
+
+
+  <p class="body>
+  The evaluation utilizes a completely random design.  
+  Each test comprises multiple trials.
+  Autoscalers under test are randomly assigned to a trial and AWS availability zone.  
+  Trials are independent.  
+  The execution environment is completely rebuilt for each trial using deterministic scripts.  
+  The required number of trials is calculated from measurements obtained during preliminary experiments.  
+  The minimum sample size is calculated to achieve a 2.50 maximum half-width of the 95% confidence interval.
+
+
+  </p>
+
+  <p class="body">
   Talk about completely random design.
   </p>
 
