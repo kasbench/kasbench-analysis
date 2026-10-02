@@ -86,12 +86,12 @@
 
   <h2>Comparative Autoscaler Metrics</h2>
 
-  <h3>Synchronous Misprovisioning Penalty (&theta;<sup>S</sup>) by Autoscaler</h3>
+  <h3>Synchronous Misprovisioning Penalty (&theta;<sup>S</sup>) by Autoscaler (&alpha; = {{ alpha }})</h3>
   <div class="table-wrap">
   {{ theta_table_html | safe }}
   </div>
  
-  <h3>Synchronous Misprovisioned Timeshare (&tau;<sup>S</sup>) by Autoscaler</h3>
+  <h3>Synchronous Misprovisioned Timeshare (&tau;<sup>S</sup>) by Autoscaler (&alpha; = {{ alpha }})</h3>
   <div class="table-wrap">
   {{ tau_table_html | safe }}
   </div>
@@ -101,15 +101,76 @@
   {{ asynchronous_metrics_table_html | safe }}
   </div>
 
-  <h3>Cost Metrics by Autoscaler</h3>
+  <h3>Cost Metrics by Autoscaler (&beta; = {{ beta }})</h3>
   <div class="table-wrap">
   {{ cost_metrics_table_html | safe }}
   </div>
 
   <h3>Summary Results by Autoscaler</h3>
+
+  <table class="data-table">
+    <thead>
+      <tr>
+        <th>Parameter</th>
+        <th>Value</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>w<sub>&theta;A</sub></td>
+        <td>{{w_theta_a}}</td>
+      </tr>
+      <tr>
+        <td>w<sub>&tau;A</sub></td>
+        <td>{{w_tau_a}}</td>
+      </tr>
+      <tr>
+        <td>w<sub>&theta;S</sub></td>
+        <td>{{w_theta_s}}</td>
+      </tr>
+      <tr>
+        <td>w<sub>&tau;S</sub></td>
+        <td>{{w_tau_s}}</td>
+      </tr>
+      <tr>
+        <td>w<sub>S</sub></td>
+        <td>{{w_s}}</td>
+      </tr>
+      <tr>
+        <td>w<sub>A</sub></td>
+        <td>{{w_a}}</td>
+      </tr>
+      <tr>
+        <td>w<sub>C</sub></td>
+        <td>{{w_c}}</td>
+      </tr>
+      <tr>
+        <td>p</td>
+        <td>{{p}}</td>
+      </tr>
+    </tbody>
+  </table>
+
+
   <div class="table-wrap">
   {{ summary_table_html | safe }}
   </div>
+
+
+
+  <div class="figure">
+    <img src="{{ summary_metrics_bar_chart }}" alt="Bar chart of the summary metrics">
+    <p class="fig-caption">Figure 4. Sub-benchmark deviations and composite score by autoscaler.</p>
+  </div>
+
+<div class="figure">
+    <img src="{{ summary_metrics_radar_chart }}" alt="Radar plot of the summary metrics">
+    <p class="fig-caption">Figure 5. Sub-benchmark deviations by autoscaler.</p>
+  </div>
+
+
+
+
 
 </body>
 </html>

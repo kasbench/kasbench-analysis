@@ -808,7 +808,7 @@ def calculate_theta_metrics(
             - slo_rt_ms
         )
         .clip(lower=0)
-        / slo_rt_ms * (k - 1)
+        / (slo_rt_ms * (k - 1))
     )
 
     time_slices["normalized_u_rt"] = np.minimum(time_slices["normalized_u_rt"], 1)
@@ -819,7 +819,7 @@ def calculate_theta_metrics(
             - slo_fr
         )
         .clip(lower=0)
-        / slo_fr * (k - 1)
+        / (slo_fr * (k - 1))
     )
 
     time_slices["normalized_u_fr"] = np.minimum(time_slices["normalized_u_fr"], 1)
@@ -906,7 +906,7 @@ def calculate_theta_metrics(
         time_slices=time_slices,
         trials=trials,
         autoscalers=autoscalers,
-    )
+    ), df
 
 
 def append_time_slice(df, earliest_start_time, latest_end_time, time_slice_seconds=30):
@@ -1203,23 +1203,16 @@ def calculate_tau_metrics(
     tolerance: float = 0.20,
 ) -> TauResults:
     """
-    Calculate all four tau time-share metrics:
+    Calculate both tau time-share metrics:
 
-        tau_u_rt:
+        tau_rt:
             Percentage of time slices in which mean response time of
             SUCCESSFUL requests exceeds the upper response-time threshold.
 
-        tau_o_rt:
-            Percentage of time slices in which mean response time of
-            SUCCESSFUL requests is below the lower response-time threshold.
-
-        tau_u_fr:
+        tau_fr:
             Percentage of time slices in which failure rate exceeds the
             upper failure-rate threshold.
 
-        tau_o_fr:
-            Percentage of time slices in which failure rate is below the
-            lower failure-rate threshold.
 
     The input dataframe contains one row per request and must already assign
     each request to a fixed-duration time slice.
@@ -1423,10 +1416,8 @@ def calculate_tau_metrics(
     # ------------------------------------------------------------------
 
     rt_upper_threshold = slo_rt_ms * (1.0 + tolerance)
-    rt_lower_threshold = slo_rt_ms * (1.0 - tolerance)
 
     fr_upper_threshold = slo_fr * (1.0 + tolerance)
-    fr_lower_threshold = slo_fr * (1.0 - tolerance)
 
     # ------------------------------------------------------------------
     # Underprovisioning indicators.
@@ -1440,17 +1431,6 @@ def calculate_tau_metrics(
         time_slices["failure_rate"] > fr_upper_threshold
     ).astype(np.int8)
 
-    # ------------------------------------------------------------------
-    # Overprovisioning indicators.
-    # ------------------------------------------------------------------
-
-    time_slices["indicator_o_rt"] = (
-        time_slices["mean_response_time_ms"] < rt_lower_threshold
-    ).astype(np.int8)
-
-    time_slices["indicator_o_fr"] = (
-        time_slices["failure_rate"] < fr_lower_threshold
-    ).astype(np.int8)
 
     # ------------------------------------------------------------------
     # Trial-level tau metrics.
@@ -1469,20 +1449,12 @@ def calculate_tau_metrics(
             dropna=False,
         )
         .agg(
-            tau_u_rt=(
+            tau_rt=(
                 "indicator_u_rt",
                 lambda values: 100.0 * values.mean(),
             ),
-            tau_o_rt=(
-                "indicator_o_rt",
-                lambda values: 100.0 * values.mean(),
-            ),
-            tau_u_fr=(
+            tau_fr=(
                 "indicator_u_fr",
-                lambda values: 100.0 * values.mean(),
-            ),
-            tau_o_fr=(
-                "indicator_o_fr",
                 lambda values: 100.0 * values.mean(),
             ),
             time_slices=(
@@ -1506,10 +1478,8 @@ def calculate_tau_metrics(
     )
 
     metric_columns = [
-        "tau_u_rt",
-        "tau_o_rt",
-        "tau_u_fr",
-        "tau_o_fr",
+        "tau_rt",
+        "tau_fr",
     ]
 
     # ------------------------------------------------------------------
@@ -1546,18 +1516,14 @@ def calculate_tau_metrics(
     )
 
 
-def add_weighted_tau(summary_df_by_autoscaler, gamma=0.50, omega=0.50):
+def add_weighted_tau(summary_df_by_autoscaler, alpha=0.50):
     """Add weighted tau metrics to the summary dataframe."""
 
     # Make a copy of the dataframe
     summary_df_by_autoscaler = summary_df_by_autoscaler.copy()
 
-    # Weight over and under provisioning by gamma
-    summary_df_by_autoscaler["tau_rt_mean"] = gamma * summary_df_by_autoscaler["tau_u_rt_mean"] + (1 - gamma) * summary_df_by_autoscaler["tau_o_rt_mean"]
-    summary_df_by_autoscaler["tau_fr_mean"] = gamma * summary_df_by_autoscaler["tau_u_fr_mean"] + (1 - gamma) * summary_df_by_autoscaler["tau_o_fr_mean"]
-    
     # Weight response time and failure rate by omega
-    summary_df_by_autoscaler["tau_mean"] = omega * summary_df_by_autoscaler["tau_rt_mean"] + (1 - omega) * summary_df_by_autoscaler["tau_fr_mean"]
+    summary_df_by_autoscaler["tau_mean"] = alpha * summary_df_by_autoscaler["tau_rt_mean"] + (1 - alpha) * summary_df_by_autoscaler["tau_fr_mean"]
     return summary_df_by_autoscaler
 
 def parse_metric_file_info(file_info):
@@ -2142,7 +2108,7 @@ def get_asynchronous_metrics(files, run_id, s3_bucket, earliest_start_time, late
     lag_df["w_t"] = lag_df["w_t"].fillna(0)
 
     # Add "theta_a" column
-    lag_df["theta_a"] = np.minimum((lag_df.w_t - w_max).clip(lower=0)/(k - 1) * w_max   , 1)
+    lag_df["theta_a"] = np.minimum((lag_df.w_t - w_max).clip(lower=0)/((k - 1) * w_max)   , 1)
     
     # Add "tau_a" time-slice column
     lag_df["tau_a"] = np.where(lag_df.w_t > w_max * (1.0 + tolerance), 1, 0)
@@ -5053,13 +5019,13 @@ def calculate_weighted_synchronous_theta(df, earliest_start_time, latest_end_tim
     df = df.copy()
     df = append_time_slice(df, earliest_start_time, latest_end_time, time_slice_seconds=time_slice_seconds)
 
-    theta_results = calculate_theta_metrics(df, slo_rt_ms=slo_rt_ms, slo_fr=slo_fr, k=k)
+    theta_results, theta_df = calculate_theta_metrics(df, slo_rt_ms=slo_rt_ms, slo_fr=slo_fr, k=k)
     
     weighted_theta_results = add_weighted_theta(
         theta_results.autoscalers,
         alpha=alpha,
     )
-    return weighted_theta_results, theta_results
+    return weighted_theta_results, theta_results, theta_df
 
 
 def latex_to_stacked_html_old(tex: str) -> str:
@@ -5213,7 +5179,7 @@ def weighted_synchronous_theta_to_html(df):
 
 
 def calculate_weighted_synchronous_tau(df, earliest_start_time, latest_end_time, slo_rt_ms=100, 
-        slo_fr=0.01, gamma=0.50, omega=0.50, time_slice_seconds=30, tolerance=0.20):
+        slo_fr=0.01, alpha=0.50, time_slice_seconds=30, tolerance=0.20):
     """ Calculates weighted tau for a dataframe """
     
     df = df.copy()
@@ -5234,8 +5200,7 @@ def calculate_weighted_synchronous_tau(df, earliest_start_time, latest_end_time,
     
     weighted_tau_results = add_weighted_tau(
         tau_results.autoscalers,
-        gamma=gamma,
-        omega=omega,
+        alpha=alpha,
     )
     
     return weighted_tau_results, tau_results
@@ -5246,10 +5211,6 @@ def weighted_synchronous_tau_to_html(df):
 
     columns_order = [
         "autoscaler",
-        "tau_u_rt_mean", 
-        "tau_o_rt_mean", 
-        "tau_u_fr_mean", 
-        "tau_o_fr_mean",
         "tau_rt_mean", 
         "tau_fr_mean", 
         "tau_mean"
@@ -5260,10 +5221,6 @@ def weighted_synchronous_tau_to_html(df):
 
     # Column mapping dictionary
     header_replacements = {
-        "tau_u_rt_mean": latex_to_stacked_html(r"\tau^{RT}_{U}"),
-        "tau_o_rt_mean": latex_to_stacked_html(r"\tau^{RT}_{O}"),
-        "tau_u_fr_mean": latex_to_stacked_html(r"\tau^{FR}_{U}"),
-        "tau_o_fr_mean": latex_to_stacked_html(r"\tau^{FR}_{O}"),
         "tau_rt_mean": latex_to_stacked_html(r"\tau^{RT}"),
         "tau_fr_mean": latex_to_stacked_html(r"\tau^{FR}"),
         "tau_mean": latex_to_stacked_html(r"\tau^{S}"),
@@ -5297,10 +5254,6 @@ def weighted_asynchronous_metrics_df_to_html(df):
     columns_order = [
        "autoscaler", 
        "lag_mean", 
-       "theta_a_u", 
-       "theta_a_o", 
-       "tau_a_u",
-       "tau_a_o", 
        "theta_a", 
        "tau_a"
     ]
@@ -5311,10 +5264,6 @@ def weighted_asynchronous_metrics_df_to_html(df):
     # Column mapping dictionary
     header_replacements = {
         "lag_mean": "Avg. Lag",
-        "theta_a_u": latex_to_stacked_html(r"\theta^{A}_{U}"),
-        "theta_a_o": latex_to_stacked_html(r"\theta^{A}_{O}"),
-        "tau_a_u": latex_to_stacked_html(r"\tau^{A}_{U}"),
-        "tau_a_o": latex_to_stacked_html(r"\tau^{A}_{O}"),
         "theta_a": latex_to_stacked_html(r"\theta^{A}"),
         "tau_a": latex_to_stacked_html(r"\tau^{A}"),
         
@@ -5347,10 +5296,13 @@ def calculate_c_metric(
     run_id, 
     earliest_start_time, 
     latest_end_time, 
+    cpu_baseline,
+    memory_baseline,
+    globeco_microservices,
     time_slice_seconds, 
     total_cpu,
     total_memory,
-    alpha):
+    beta):
 
     # Get list of S3 files
     files = get_s3_file_listing(s3_bucket, run_id)
@@ -5360,11 +5312,15 @@ def calculate_c_metric(
     cpu_column_label = "cores"
     cpu_requests_df = get_merged_range_metric_df(files, run_id, s3_bucket, cpu_metric, cpu_column_label)
     
+    # Delete rows in cpu_requests_df where container is NOT in globeco_microservices
+    cpu_requests_df = cpu_requests_df[cpu_requests_df.container.isin(globeco_microservices)]
+    
     # Pull Memory metrics
     memory_metric = "kube_pod_container_resource_requests-container,memory"
     memory_column_label = "bytes"
     memory_requests_df = get_merged_range_metric_df(files, run_id, s3_bucket, memory_metric, memory_column_label)
-
+    # Delete rows in memory_requests_df where container is NOT in globeco_microservices
+    memory_requests_df = memory_requests_df[memory_requests_df.container.isin(globeco_microservices)]
 
 
     c_bar_df = cpu_requests_df.merge(memory_requests_df, on=["timestamp", "autoscaler", "trial_id", "container"], suffixes=["_cpu", "_memory"])
@@ -5398,30 +5354,38 @@ def calculate_c_metric(
         bytes=("bytes", "sum")
     ).reset_index()
 
+    c_bar_df["c_bar_cpu"] = (c_bar_df["cores"] - cpu_baseline)/(total_cpu - cpu_baseline)
+    c_bar_df["c_bar_mem"] = (c_bar_df["bytes"] - memory_baseline)/(total_memory - memory_baseline)
+
+    
     # Calculate the mean of the sum of cores and bytes for each autoscaler, and trial_id
     c_bar_df = c_bar_df.groupby(["autoscaler", "trial_id"]).agg(
-        cores=("cores", "mean"),
-        bytes=("bytes", "mean")
+        c_bar_cpu=("c_bar_cpu", "mean"),
+        c_bar_mem=("c_bar_mem", "mean")
     ).reset_index()
-
+    
     
     # Calculate the mean of cores and bytes for each autoscaler
     c_bar_df = c_bar_df.groupby(["autoscaler"]).agg(
-        c_bar_cpu=("cores", "mean"),
-        c_bar_mem=("bytes", "mean")
+        c_bar_cpu=("c_bar_cpu", "mean"),
+        c_bar_mem=("c_bar_mem", "mean")
     ).reset_index()
 
-    c_bar_df["c_bar_cpu"] /= total_cpu 
-    c_bar_df["c_bar_mem"] /= total_memory 
+    # c_bar_df["original_mem"] = c_bar_df["c_bar_mem"]
+
+    # c_bar_df["c_bar_cpu"] /= total_cpu 
+    # c_bar_df["c_bar_mem"] /= total_memory 
+
+
 
     c_bar_df["c_bar_cpu"] *= 100 
     c_bar_df["c_bar_mem"] *= 100 
 
     # Convert bytes to GB
-    c_bar_df["c_bar_mem"] /= (1024**3)
+    # c_bar_df["c_bar_mem"] /= (1024**3)
 
     # Calulate c_bar
-    c_bar_df["c_bar"] = alpha * c_bar_df["c_bar_cpu"] + (1 - alpha) * c_bar_df["c_bar_mem"]
+    c_bar_df["c_bar"] = beta * c_bar_df["c_bar_cpu"] + (1 - beta) * c_bar_df["c_bar_mem"]
 
     return c_bar_df
 
@@ -5471,15 +5435,15 @@ def cost_metrics_df_to_html(df):
 
 def summary_df_to_html(df):
     df = df.copy()
-
     columns_order = [
        "autoscaler", 
-       "theta_mean", 
-       "tau_mean", 
+       "theta_s", 
+       "tau_s", 
        "theta_a",
        "tau_a",
-       "&zeta;",
        "c_bar",
+       "zeta",
+       
     ]
 
     df = df[columns_order]
@@ -5497,11 +5461,11 @@ def summary_df_to_html(df):
 
     # Column mapping dictionary
     header_replacements = {
-        "theta_mean": latex_to_stacked_html(r"\bar{\theta}^{S}"),
-        "tau_mean": latex_to_stacked_html(r"\bar{\tau}^{S}"),
+        "zeta": "&zeta;",
+        "theta_s": latex_to_stacked_html(r"\theta^{S}"),
+        "tau_s": latex_to_stacked_html(r"\tau^{S}"),
         "theta_a": latex_to_stacked_html(r"\theta^{A}"),
         "tau_a": latex_to_stacked_html(r"\tau^{A}"),
-        # "&zeta;": latex_to_stacked_html(r"\zeta"),
         "c_bar": latex_to_stacked_html(r"\bar{C}"),
 
     }
@@ -5527,3 +5491,247 @@ def summary_df_to_html(df):
         html = html.replace(original_col, formatted_col)
 
     return html
+
+def calc_zeta(summary_df, w_theta_a, w_tau_a, w_theta_s, w_tau_s, w_s, w_a, w_c, p=3):
+
+    summary_df = summary_df.copy()
+
+    # Validate weights
+    assert(w_theta_s + w_tau_s == 1, "w_theta_s + w_tau_s must equal 1")
+    assert(w_theta_a + w_tau_a == 1, "w_theta_a + w_tau_a must equal 1")
+    assert(w_s + w_a + w_c == 1, "w_s + w_a + w_c must equal 1")
+
+    # Calculate synchronous deviation score 
+    summary_df["d_s"] = (w_theta_s * summary_df.theta_s**p + w_tau_s * summary_df.tau_s**p)**(1/p)
+    
+    # Calculate the asynchronous deviation score
+    summary_df["d_a"] = (w_theta_a * summary_df.theta_a**p + w_tau_a * summary_df.tau_a**p)**(1/p)
+    
+    # Calculate zeta
+    summary_df["zeta"] = (w_s * summary_df.d_s**p + w_a * summary_df.d_a**p + w_c * summary_df.c_bar**p)**(1/p)
+
+    return summary_df
+
+
+def plot_summary_metrics_bar_chart(
+    summary_df,
+    *,
+    autoscaler_order: list[str] | None = None,
+    filename: str = "../figures/failure_rate_by_autoscaler.png",
+    show: bool = False,
+    include_title: bool = False,):
+
+    if autoscaler_order is None:
+        autoscaler_order=["none", "hpa", "vpa", "keda"]
+    autoscaler_order = [s.upper() for s in autoscaler_order]
+
+    # 1. Prepare data and ensure autoscaler names are uppercase
+    df = summary_df.copy()
+    df["autoscaler"] = df["autoscaler"].astype(str).str.upper()
+
+    # Order of metrics matching the image: \theta^S, \theta^A, \tau^S, \tau^A, \zeta, \bar{C}
+    metric_cols = ["theta_s", "theta_a", "tau_s", "tau_a", "c_bar", "zeta",]
+    metric_labels = [
+        r"$\theta^S$",
+        r"$\theta^A$",
+        r"$\tau^S$",
+        r"$\tau^A$",
+        r"$\bar{C}$",
+        r"$\zeta$",
+    ]
+
+    # Set autoscaler as index to easily slice metric rows/columns
+    df_indexed = df.set_index("autoscaler")
+    autoscalers = df_indexed.index.tolist()
+
+    # 2. Plot setup
+    fig, ax = plt.subplots(figsize=(11, 6), dpi=300)
+
+    n_metrics = len(metric_cols)
+    n_autoscalers = len(autoscalers)
+
+    x = np.arange(n_metrics)
+    total_group_width = 0.65
+    bar_width = total_group_width / n_autoscalers
+
+    # 3. Draw grouped bars
+    for i, autoscaler in enumerate(autoscaler_order):
+        # Center the cluster of bars over the metric ticks
+        offset = (i - (n_autoscalers - 1) / 2) * bar_width
+        values = df_indexed.loc[autoscaler, metric_cols].values
+        ax.bar(x + offset, values, width=bar_width, label=autoscaler)
+
+    # 4. Styling & Labels
+    ax.set_title(
+        "KASBench Sub-Benchmark Deviations and Composite Score", fontsize=14, pad=10
+    )
+    ax.set_ylabel("Deviation / Score", fontsize=12)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(metric_labels, fontsize=13)
+    ax.tick_params(axis="y", labelsize=11)
+    ax.tick_params(axis="x", bottom=True, length=4)
+
+    ax.set_ylim(bottom=0)
+    ax.legend(loc="upper left", frameon=True, fontsize=11)
+
+    plt.tight_layout()
+
+    plt.savefig(filename, dpi=300, bbox_inches="tight")
+    
+    plt.show()
+
+    plt.close()
+
+def plot_summary_statistics_barchart_two_by_three(summary_df):
+    """ NOT CURRENTLY USING """
+    # Set overall publication/academic aesthetic
+    sns.set_theme(style="ticks")
+    plt.rcParams.update(
+        {
+            "font.size": 11,
+            "axes.labelsize": 12,
+            "axes.titlesize": 14,
+            "xtick.labelsize": 10,
+            "ytick.labelsize": 10,
+        }
+    )
+
+    # Mapping of raw column names to LaTeX representations
+    metric_labels = {
+        "theta_s": r"$\theta^S$",
+        "tau_s": r"$\tau^S$",
+        "theta_a": r"$\theta^A$",
+        "tau_a": r"$\tau^A$",
+        "c_bar": r"$\bar{C}$",
+        "zeta": r"$\zeta$",
+    }
+
+    metrics = list(metric_labels.keys())
+
+    # Create a copy with capitalized autoscaler names for clean legend & x-ticks
+    plot_df = summary_df.copy()
+    plot_df["autoscaler"] = plot_df["autoscaler"].astype(str).str.upper()
+
+    # Set up a 2x3 grid of subplots
+    fig, axes = plt.subplots(nrows=2, ncols=3, figsize=(13, 8), sharey=True)
+    axes = axes.flatten()
+
+    # Pick a distinct, accessible color palette
+    unique_autoscalers = plot_df["autoscaler"].unique()
+    palette = sns.color_palette("muted", n_colors=len(unique_autoscalers))
+    color_map = dict(zip(unique_autoscalers, palette))
+
+    # Plot each metric across the subplots
+    for i, metric in enumerate(metrics):
+        ax = axes[i]
+        sns.barplot(
+            data=plot_df,
+            x="autoscaler",
+            y=metric,
+            hue="autoscaler",
+            palette=color_map,
+            edgecolor="black",
+            linewidth=0.8,
+            dodge=False,
+            ax=ax,
+        )
+
+        # Set subplot title to LaTeX metric notation
+        ax.set_title(metric_labels[metric], pad=10)
+        ax.set_xlabel("")
+
+        # Gridlines and styling
+        ax.grid(axis="y", linestyle="--", alpha=0.6)
+        ax.tick_params(bottom=False)
+
+        # Avoid duplicate individual subplot legends
+        if ax.get_legend() is not None:
+            ax.get_legend().remove()
+
+    # Configure y-axis label across the faceted layout
+    axes[0].set_ylabel("Deviation/Score")
+    axes[3].set_ylabel("Deviation/Score")
+
+    # Unified figure legend placed neatly at the top
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(
+        handles,
+        labels,
+        title="Autoscaler",
+        bbox_to_anchor=(0.5, 1.02),
+        loc="lower center",
+        ncol=len(unique_autoscalers),
+        frameon=True,
+        edgecolor="lightgray",
+    )
+
+    plt.tight_layout()
+    plt.show()
+
+def plot_summary_metrics_radar_chart(
+    summary_df, 
+    filename):
+
+    # 1. Prepare data
+    df = summary_df.copy()
+    df["autoscaler"] = df["autoscaler"].astype(str).str.upper()
+
+    metrics = ["theta_s", "tau_s", "theta_a", "tau_a", "c_bar"]
+    labels = [r"$\theta^S$", r"$\tau^S$", r"$\theta^A$", r"$\tau^A$", r"$\bar{C}$"]
+    num_vars = len(metrics)
+
+    # Normalize relative to max (or your preferred benchmark scale)
+    df_indexed = df.set_index("autoscaler")[metrics]
+    df_norm = df_indexed / df_indexed.max()
+
+    # 2. Compute radar angles evenly from 0 to 2*pi
+    # Matplotlib's set_theta_offset and set_theta_direction will position these
+    angles = np.linspace(0, 2 * np.pi, num_vars, endpoint=False).tolist()
+    angles_closed = angles + angles[:1]
+
+    # 3. Setup radar plot
+    fig, ax = plt.subplots(figsize=(8, 8), subplot_kw=dict(polar=True), dpi=300)
+
+    # Position 0 radians at the top (12 o'clock) and advance clockwise
+    ax.set_theta_offset(np.pi / 2)
+    ax.set_theta_direction(-1)
+
+    # Align tick labels with exact vertex angles
+    ax.set_xticks(angles)
+    ax.set_xticklabels(labels, fontsize=14)
+
+    # Radial grid settings
+    ax.set_rlabel_position(45)
+    ax.set_yticks([0.2, 0.4, 0.6, 0.8, 1.0])
+    ax.set_yticklabels(["0.2", "0.4", "0.6", "0.8", "1.0"], fontsize=12)
+    ax.set_ylim(0, 1.05)
+
+    # Grid styling
+    ax.grid(color="gray", linestyle="-", linewidth=0.7, alpha=0.6)
+    ax.spines["polar"].set_edgecolor("black")
+    ax.spines["polar"].set_linewidth(1.2)
+
+    # 4. Plot each autoscaler profile
+    for autoscaler, row in df_norm.iterrows():
+        values = row.tolist()
+        values_closed = values + values[:1]
+        (line,) = ax.plot(angles_closed, values_closed, linewidth=2.5, label=autoscaler)
+        ax.fill(angles_closed, values_closed, alpha=0.1, color=line.get_color())
+
+    # 5. Title & Legend
+    ax.set_title("KASBench Overall Profile", fontsize=16, pad=25)
+    ax.legend(
+        loc="upper right",
+        bbox_to_anchor=(1.25, 1.1),
+        frameon=True,
+        fontsize=13,
+    )
+
+    plt.tight_layout()
+
+    plt.savefig(filename, dpi=300, bbox_inches="tight")
+
+    plt.show()
+
+    plt.close()
