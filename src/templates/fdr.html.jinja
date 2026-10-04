@@ -34,7 +34,8 @@
     ({{- theta_s -}}, {{ theta_a -}}, {{ tau_s -}}, {{ tau_a -}}, and {{ bar_c -}})
   and three composite scores
     ({{- d_s -}}, {{ d_a -}}, and {{ zeta -}}). 
-  These metrics and composite scores measure deviation from the ideal, and are in the range 0 to 100 inclusive.  
+  These metrics and composite scores measure deviation from the ideal, and are in the range 0 (best) to 100 (worst) inclusive.  Lower
+  scores represent autoscaler performance closer to the ideal.
   </p>
 
   <p class="body">
@@ -77,52 +78,52 @@
 
 
   <p class="body">
-  <strong>Derived synchronous composite score ({{- d_s -}})</strong>
+  <strong>Derived synchronous composite score ({{- d_s -}})</strong> is the weighted Minkowski deviation (distance) of 
+  {{ theta_s }} and {{ tau_s }} from zero.
   </p>
   
   <p class="body">
-  <strong>Derived asynchronous composite score ({{- d_a -}})</strong>
+  <strong>Derived asynchronous composite score ({{- d_a -}})</strong> is the weighted Minkowski deviation (distance) of 
+  {{ theta_a }} and {{ tau_a }} from zero.
+  </p>
   </p>
 
   <p class="body">
-  <strong>Composite score ({{- zeta -}})</strong> is an aggregate of {{ d_s }} and {{ d_a -}}.
+  <strong>Composite score ({{- zeta -}})</strong> is the weighted Minkowski distance of {{ d_s }}, {{ d_a }}, and {{ bar_c -}}.
   </p>
 
   <p class="body">
+  The evaluation utilizes a completely random design.  Each benchmark evaluation comprises multiple trials.  The number of 
+  trials per autoscaler is indicated in the <em>Metadata</em> section of this document.  Trials are independent.  Each trial
+  is conducted in an identical, individually built, one-time-use virtual private cloud in a randomly selected Amazon Web Services (AWS)
+  availability zone.  Autoscalers under test are randomly assigned to a trial and AWS availability zone.  
   </p>
+
+
+  <h2>Autoscalers Under Test</h2>
+
+  This section describes the configuration of each autoscaler under test.  Autoscalers are expected to be configured optimally for the benchmark
+  evaluation, including resource requests and limits, number of replicas, and autoscaler-specific configuration.
+
+  {% for autoscaler in autoscaler_descriptions %}
+
+  <h3>{{ autoscaler["name"] -}}</h3>
 
   <p class="body">
+  {{ autoscaler["description"] }}
   </p>
 
+  {% endfor %}
 
-
-  <p class="body>
-  The evaluation utilizes a completely random design.  
-  Each test comprises multiple trials.
-  Autoscalers under test are randomly assigned to a trial and AWS availability zone.  
-  Trials are independent.  
-  The execution environment is completely rebuilt for each trial using deterministic scripts.  
-  The required number of trials is calculated from measurements obtained during preliminary experiments.  
-  The minimum sample size is calculated to achieve a 2.50 maximum half-width of the 95% confidence interval.
-
-
-  </p>
+  <h2>The Full Disclosure Report (FDR)</h2>
 
   <p class="body">
-  Talk about completely random design.
+  The following sections are produced systematically from data captured during the execution of the benchmark evaluation.  All material 
+  parameters, settings, versions, hashes, and descriptions are included to foster reproducibility.  
   </p>
 
-  <p>
-  Talk about run duration and number of trials
-  </p>
 
-  <p>
-  Insert a section for each autoscaler (how configured)
-  </p>
-
-  </p>
-
-<div class="page-break"></div>
+  <div class="page-break"></div>
 
   <h2>Benchmark Metadata</h2>
 
@@ -147,6 +148,8 @@
   <div class="table-wrap">
   {{ statefulsets_table_html | safe }}
   </div>
+
+<div class="page-break"></div>
 
   <h3>Stateless Services</h3>
   
@@ -183,12 +186,14 @@
 
   <h2>Comparative Autoscaler Metrics</h2>
 
-  <h3>Synchronous Misprovisioning Penalty (&theta;<sup>S</sup>) by Autoscaler (&alpha; = {{ alpha }})</h3>
+  <h3>Synchronous Underprovisioning Penalty (&theta;<sup>S</sup>) by Autoscaler (&alpha; = {{ alpha }})</h3>
   <div class="table-wrap">
   {{ theta_table_html | safe }}
   </div>
  
-  <h3>Synchronous Misprovisioned Timeshare (&tau;<sup>S</sup>) by Autoscaler (&alpha; = {{ alpha }})</h3>
+ <div class="page-break"></div>
+
+  <h3>Synchronous Underprovisioned Timeshare (&tau;<sup>S</sup>) by Autoscaler (&alpha; = {{ alpha }})</h3>
   <div class="table-wrap">
   {{ tau_table_html | safe }}
   </div>
@@ -204,6 +209,14 @@
   </div>
 
   <h3>Summary Results by Autoscaler</h3>
+
+  <div class="table-wrap">
+  {{ summary_table_html | safe }}
+  </div>
+
+ <div class="page-break"></div>
+
+  <h3>Parameters</h3>
 
   <table class="data-table">
     <thead>
@@ -249,10 +262,7 @@
   </table>
 
 
-  <div class="table-wrap">
-  {{ summary_table_html | safe }}
-  </div>
-
+  
 
 
   <div class="figure">
