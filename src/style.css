@@ -114,3 +114,11 @@ thead {
 tfoot {
     display: table-footer-group; /* Forces footer repeat */
 }
+
+
+@media print {
+  .page-break {
+    break-before: page;
+    page-break-before: always; /* Fallback for older engines */
+  }
+}

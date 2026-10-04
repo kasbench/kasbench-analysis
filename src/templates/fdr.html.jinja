@@ -51,15 +51,41 @@
   </p>
 
   <p class="body">
+  <strong>Asynchronous underprovisioning penalty ({{- theta_a -}})</strong> quantifies the how long asynchronous tasks wait 
+  in queue beyond a predetermined baseline ({{- w_max }} second{{- 's' if w_max != 1 else '' -}}). Asynchronous tasks are triggered indirectly
+  from synchronous requests. Results are calculated as a percentage in the range 0 to 100, inclusive, using an upper bound of 
+  {{ k_word -}}-times the SLO.
+  </p>
+
+  <p class="body">
+  <strong>Asynchronous underprovisioned time slices ({{-tau_a-}})</strong> measures the percentage of {{ time_slice_seconds -}}-second
+  time slices during which asynchronous tasks exceed the baseline by more than {{ tolerance_percent -}}%. 
+  </p>
+
+  <p class="body">
+  <strong>Blended mean resource utilization ({{- bar_c -}})</strong> is the blended percentage of available CPU and memory 
+  requested by each autoscaler in excess of a baseline.  The baseline is calculated as the minimum resources that could be allocated by any
+  autoscaler in the test.  
+  </p>
+
+
+  <p class="body">
+
+  The metrics {{theta_s-}}, {{tau_s-}}, {{theta_a-}}, {{tau_a-}}, and {{ bar_c }} represent deviation from the ideal on a scale of 0 to 100, inclusive.
+
+  </p>
+
+
+  <p class="body">
+  <strong>Derived synchronous composite score ({{- d_s -}})</strong>
+  </p>
   
-
-
+  <p class="body">
+  <strong>Derived asynchronous composite score ({{- d_a -}})</strong>
   </p>
 
   <p class="body">
-  </p>
-
-  <p class="body">
+  <strong>Composite score ({{- zeta -}})</strong> is an aggregate of {{ d_s }} and {{ d_a -}}.
   </p>
 
   <p class="body">
@@ -95,6 +121,8 @@
   </p>
 
   </p>
+
+<div class="page-break"></div>
 
   <h2>Benchmark Metadata</h2>
 
