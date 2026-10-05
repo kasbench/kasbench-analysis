@@ -13,6 +13,9 @@ import shutil
 import tempfile
 from urllib.parse import urlparse
 import subprocess
+from collections import defaultdict
+from html import escape
+
 
 
 import boto3
@@ -4115,7 +4118,7 @@ def plot_mean_response_time_by_autoscaler(
     autoscaler_order: list[str] | None = None,
     confidence_level: float = 0.95,
     random_seed: int = 42,
-    filename: str = "../figures/response_time_by_autoscaler.png",
+    filename: str = "./figures/response_time_by_autoscaler.png",
     show: bool = False,
     include_title: bool = False,
 ) -> tuple[plt.Figure, plt.Axes, str]:
@@ -4324,7 +4327,7 @@ def plot_failure_rate_by_autoscaler(
     autoscaler_order: list[str] | None = None,
     confidence_level: float = 0.95,
     random_seed: int = 42,
-    filename: str = "../figures/failure_rate_by_autoscaler.png",
+    filename: str = "./figures/failure_rate_by_autoscaler.png",
     show: bool = False,
     include_title: bool = False,
 ) -> tuple[plt.Figure, plt.Axes]:
@@ -4561,7 +4564,7 @@ def plot_roundtrip_completion_by_autoscaler(
     autoscaler_order: list[str] | None = None,
     confidence_level: float = 0.95,
     random_seed: int = 42,
-    filename: str = "../figures/roundtrip_completion_by_autoscaler.png",
+    filename: str = "./figures/roundtrip_completion_by_autoscaler.png",
     show: bool = False,
     include_title: bool = False,
 ) -> tuple[plt.Figure, plt.Axes]:
@@ -5497,9 +5500,9 @@ def calc_zeta(summary_df, w_theta_a, w_tau_a, w_theta_s, w_tau_s, w_s, w_a, w_c,
     summary_df = summary_df.copy()
 
     # Validate weights
-    assert(w_theta_s + w_tau_s == 1, "w_theta_s + w_tau_s must equal 1")
-    assert(w_theta_a + w_tau_a == 1, "w_theta_a + w_tau_a must equal 1")
-    assert(w_s + w_a + w_c == 1, "w_s + w_a + w_c must equal 1")
+    assert w_theta_s + w_tau_s == 1, "w_theta_s + w_tau_s must equal 1"
+    assert w_theta_a + w_tau_a == 1, "w_theta_a + w_tau_a must equal 1"
+    assert w_s + w_a + w_c == 1, "w_s + w_a + w_c must equal 1"
 
     # Calculate synchronous deviation score 
     summary_df["d_s"] = (w_theta_s * summary_df.theta_s**p + w_tau_s * summary_df.tau_s**p)**(1/p)
@@ -5735,3 +5738,224 @@ def plot_summary_metrics_radar_chart(
     plt.show()
 
     plt.close()
+
+def populate_metadata(experiment_progress, tofu_outputs, run_details, run_id, autoscaler_lookup, s3_bucket, report_date):
+    metadata = {}
+
+    # Hardcode the benchmark name
+    metadata["benchmark_name"] = {"name": "Benchmark Name", "value": "KASBench"}
+
+    #Get the version from run_details.json
+    metadata["version"] = {"name": "Version", "value": experiment_progress["version"]} 
+
+    # Get start and end time from run_details.json
+    start_time = datetime.datetime.fromisoformat(run_details["status"]["startTime"].replace("Z", "+00:00"))
+    end_time = datetime.datetime.fromisoformat(run_details["status"]["endTime"].replace("Z", "+00:00"))
+    metadata["testing_dates"] = {"name": "Testing Dates", "value": f"{start_time.strftime('%Y-%m-%d %H:%M:%S')} UTC to {end_time.strftime('%Y-%m-%d %H:%M:%S')} UTC"}
+
+    start_time, end_time = get_start_end_time(s3_bucket, run_id)
+    metadata["start_time"] = {"name": "start_time", "value": start_time}
+    metadata["end_time"] = {"name": "end_time", "value": end_time}
+    metadata["testing_dates"] = {"name": "Testing Dates", "value": f"{start_time} UTC to {end_time} UTC"}
+
+    # Default the reporting date to now
+    metadata["reporting_date"] = {"name": "Reporting Date", "value": report_date.strftime('%Y-%m-%d %H:%M:%S') + " UTC"}
+
+    # Hardcode the benchmark application and cloud provider
+    metadata["benchmark_application"] = {"name": "Benchmark Application", "value": "GlobeCo"}
+    metadata["cloud_provider"] = {"name": "Cloud Provider", "value": "Amazon Web Services"}
+
+    # Get the region from experiment_progress.json
+    metadata["region"] = {"name": "Region", "value": experiment_progress["parameters"]["aws_region"]}
+
+    # Get the benchmark runner control plane, and worker nodes from tofu_outputs.json
+    metadata["bencmark_runner"] = {"name": "Benchmark Runner", 
+        "value": tofu_outputs["benchmark_runner"]["value"]["instance_type"] + " (" + 
+        tofu_outputs["benchmark_runner"]["value"]["architecture"] + ")"}
+    metadata["control_plane"] = {"name": "Control Plane", 
+        "value": tofu_outputs["control_plane"]["value"]["instance_type"] + " (" + 
+        tofu_outputs["control_plane"]["value"]["architecture"] + ")"}
+
+
+    worker_nodes = tofu_outputs["worker_nodes"]["value"]
+    amd_nodes = len(worker_nodes["amd64"])
+    arm_nodes = len(worker_nodes["arm64"])
+    if amd_nodes:
+        amd_instance_type = worker_nodes["amd64"][0]["instance_type"]
+        metadata["worker_nodes_amd"] = {"name": "Worker Nodes AMD", "value": f"{amd_nodes} x {amd_instance_type}"}
+    if arm_nodes:
+            arm_instance_type = worker_nodes["arm64"][0]["instance_type"]
+            metadata["worker_nodes_arm"] = {"name": "Worker Nodes ARM", "value": f"{arm_nodes} x {arm_instance_type}"}
+
+
+    # Hardcoded storage type (controlled by the Globeco Helm chart)
+    # metadata["storage_type_ios"] = {"name": "Storage Type", "value": "EBS gp3 3000 IOPS 125 MiB/s"}
+
+    # Get AMIs from tofu_outputs.json
+    ami_ids = tofu_outputs["ami_ids"]["value"]
+    metadata["ami_amd64"] = {"name": "AMD Worker AMI ID", "value": ami_ids["amd64"]}
+    metadata["ami_arm64"] = {"name": "ARM Worker AMI ID", "value": ami_ids["arm64"]}
+    metadata["ami_runner_amd64"] = {"name": "AMD Runner AMI ID", "value": ami_ids["ami_runner_amd64"]}
+
+    # Get Kubernetes version from run_details.json
+    kubernetes_version = run_details["initialization"]["kubernetesVersion"]
+    metadata["kubernetes_version"] = {"name": "Kubernetes Version", "value": kubernetes_version}
+
+    # Hardcoded container runtime (in installation script)
+    # metadata["Container Runtime"] = "Containerd"
+
+    # Get the autoscalers from experiment_progress.json
+    autoscalers = experiment_progress["parameters"]["autoscalers"]
+    # autoscalers = [a.upper() for a in autoscalers]
+    autoscalers = [autoscaler_lookup[a] for a in autoscalers]
+    metadata["autoscalers"] = {"name": "Autoscalers Evaluated", "value": ", ".join(autoscalers)}
+
+    # Get the number of trials from experiment_progress.json
+    trials_per_autoscaler = experiment_progress["parameters"]["trials_per_autoscaler"]
+    metadata["trials_per_autoscaler"] = {"name": "Trials Per Autoscaler", "value": trials_per_autoscaler}
+
+    return metadata
+
+
+
+def deployments_to_html(deployments_df):
+    df = deployments_df.copy()
+
+    # Sort/group as desired before suppressing duplicate deployment names.
+    # If the existing order is already correct, this preserves it.
+    df["Deployment_display"] = df["Deployment"].where(
+        ~df["Deployment"].duplicated(),
+        ""
+    )
+
+    # Build the combined Image / ImageID cell.
+    # Escape values so characters such as &, <, and > remain valid HTML.
+    df["Image_display"] = df.apply(
+        lambda row: (
+            f"{escape(str(row['Image']))}"
+            f"<br>"
+            f"<span class=\"image-id\">{escape(str(row['ImageID']))}</span>"
+        ),
+        axis=1
+    )
+
+    # Generate the HTML table.
+    html = df[["Deployment_display", "Image_display"]].to_html(
+        index=False,
+        escape=False,
+        header=True,
+        classes="data-table compact",
+        border=0
+    )
+
+    html = html.replace("Deployment_display", "Deployment")
+    html = html.replace("Image_display", "Image")
+
+    return html
+
+def statefulset_to_html(statefulsets_df):
+    df = statefulsets_df.copy()
+
+    # Build the combined Image / ImageID cell.
+    # Escape values so characters such as &, <, and > remain valid HTML.
+    df["Image"] = df.apply(
+        lambda row: (
+            f"{escape(str(row['Image_original']))}"
+            f"<br>"
+            f"<span class=\"image-id\">{escape(str(row['ImageID']))}</span>"
+        ),
+        axis=1
+    )
+
+    # Generate the HTML table.
+    html = df[["Stateful Set", "Image"]].to_html(
+        index=False,
+        escape=False,
+        header=True,
+        classes="data-table compact",
+        border=0
+    )
+
+    return html
+
+def compile_container_images(s3_bucket, run_id, sample_trial):
+    images = get_images(s3_bucket, run_id, sample_trial)
+    # combine images
+    deployments = defaultdict(set)
+    statefulsets = defaultdict(set)
+    for image in images:
+        for workload in image["workloads"]:
+            # if not workload["name"].startswith("globeco"):
+            #     continue
+            if workload["kind"] == "Deployment":
+                for container in workload["containers"]:
+                    if match := re.match(r'kasbench\/(.+):', container["image"]):
+                        name = match.group(1)
+                    else:
+                        continue
+                    deployments[name] = {
+                        "Deployment": container["name"],
+                        "Image": container["image"],
+                        "ImageID": container["imageID"]
+                    }
+            elif workload["kind"] == "StatefulSet":
+                for container in workload["containers"]:
+                    image = container["image"]
+                    # name is everything before the colon
+                    if ":" in image:
+                        name = image.split(":")[0]
+                    statefulsets[container["name"]] = {
+                        "Stateful Set": name,
+                        "Image_original": image,
+                        "ImageID": container["imageID"]
+                    }
+
+    # Convert the deployments dict to a DataFrame
+    deployments_df = pd.DataFrame(deployments).T
+
+    # Drop the index column
+    deployments_df = deployments_df.reset_index(drop=True)
+
+    # Sort by deployment
+    deployments_df = deployments_df.sort_values(by="Deployment")
+
+    # In the ImageID column, replace "@" with a space
+    deployments_df["ImageID"] = deployments_df["ImageID"].str.replace("@", " ", regex=False)
+
+    # params["deployments_table_html"] = deployments_to_html(deployments_df)
+
+    # Convert the statefulsets dict to a DataFrame
+    statefulsets_df = pd.DataFrame(statefulsets).T
+
+    # Drop the index column
+    statefulsets_df = statefulsets_df.reset_index(drop=True)
+
+    # Remove duplicates
+    # statefulsets_df = statefulsets_df.drop_duplicates(subset=["Image"])
+    statefulsets_df = statefulsets_df.drop_duplicates()
+    # In the ImageID column, replace "@" with a space
+    statefulsets_df["ImageID"] = statefulsets_df["ImageID"].str.replace("@", " ", regex=False)
+
+    # params["statefulsets_table_html"] = statefulset_to_html(statefulsets_df)
+
+    return deployments_to_html(deployments_df), statefulset_to_html(statefulsets_df)
+
+def generate_performance_plots(log_df, files, s3_bucket, run_id):
+    # Summarize by trial
+    trial_summary_df = get_trial_summary_df(log_df)
+
+    # Merge with roundtrip percentages
+    merged_trial_summary_df = merge_roundtrip_completion_percentage(None, s3_bucket, trial_summary_df, run_id)
+
+    # Summary by autoscaler
+    autoscaler_summary_df = get_autoscaler_summary(merged_trial_summary_df)
+
+    # Generate mean response time by autoscaler plot
+    _, _, response_time_filename = plot_mean_response_time_by_autoscaler(trial_summary_df, show=False)
+    
+    # Generate failure rate by autoscaler plot
+    _, _, failure_rate_filename = plot_failure_rate_by_autoscaler(merged_trial_summary_df, show=False)
+    
+    _, _, round_trip_filename = plot_roundtrip_completion_by_autoscaler(merged_trial_summary_df, show=False)
+    
+    return response_time_filename, failure_rate_filename, round_trip_filename
