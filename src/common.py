@@ -15,6 +15,9 @@ from urllib.parse import urlparse
 import subprocess
 from collections import defaultdict
 from html import escape
+from pathlib import Path
+import yaml
+
 
 
 
@@ -26,6 +29,12 @@ from prometheus_api_client import PrometheusConnect, MetricRangeDataFrame
 import matplotlib.pyplot as plt
 from scipy import stats
 from latex2mathml.converter import convert
+import seaborn as sns
+from playwright.async_api import async_playwright
+import jinja2
+import docker
+
+
 
 s3 = boto3.client("s3")
 
@@ -5444,6 +5453,8 @@ def summary_df_to_html(df):
        "tau_s", 
        "theta_a",
        "tau_a",
+       "d_s",
+       "d_a",
        "c_bar",
        "zeta",
        
@@ -5469,6 +5480,8 @@ def summary_df_to_html(df):
         "tau_s": latex_to_stacked_html(r"\tau^{S}"),
         "theta_a": latex_to_stacked_html(r"\theta^{A}"),
         "tau_a": latex_to_stacked_html(r"\tau^{A}"),
+        "d_s": latex_to_stacked_html(r"D^{S}"),
+        "d_a": latex_to_stacked_html(r"D^{A}"),
         "c_bar": latex_to_stacked_html(r"\bar{C}"),
 
     }
@@ -5582,7 +5595,8 @@ def plot_summary_metrics_bar_chart(
 
     plt.savefig(filename, dpi=300, bbox_inches="tight")
     
-    plt.show()
+    if show:
+        plt.show()
 
     plt.close()
 
@@ -5674,7 +5688,8 @@ def plot_summary_statistics_barchart_two_by_three(summary_df):
 
 def plot_summary_metrics_radar_chart(
     summary_df, 
-    filename):
+    filename,
+    show=False):
 
     # 1. Prepare data
     df = summary_df.copy()
@@ -5735,7 +5750,8 @@ def plot_summary_metrics_radar_chart(
 
     plt.savefig(filename, dpi=300, bbox_inches="tight")
 
-    plt.show()
+    if show:
+        plt.show()
 
     plt.close()
 
@@ -5762,8 +5778,8 @@ def populate_metadata(experiment_progress, tofu_outputs, run_details, run_id, au
     metadata["reporting_date"] = {"name": "Reporting Date", "value": report_date.strftime('%Y-%m-%d %H:%M:%S') + " UTC"}
 
     # Hardcode the benchmark application and cloud provider
-    metadata["benchmark_application"] = {"name": "Benchmark Application", "value": "GlobeCo"}
-    metadata["cloud_provider"] = {"name": "Cloud Provider", "value": "Amazon Web Services"}
+    # metadata["benchmark_application"] = {"name": "Benchmark Application", "value": "GlobeCo"}
+    # metadata["cloud_provider"] = {"name": "Cloud Provider", "value": "Amazon Web Services"}
 
     # Get the region from experiment_progress.json
     metadata["region"] = {"name": "Region", "value": experiment_progress["parameters"]["aws_region"]}
@@ -5958,7 +5974,7 @@ def generate_performance_plots(log_df, files, s3_bucket, run_id):
     
     _, _, round_trip_filename = plot_roundtrip_completion_by_autoscaler(merged_trial_summary_df, show=False)
     
-    return response_time_filename, failure_rate_filename, round_trip_filename
+    return response_time_filename, failure_rate_filename, round_trip_filename, merged_trial_summary_df, autoscaler_summary_df
 
 def parse_cpu(cpu_string):
     # Remove 'm' and convert to float
@@ -6007,3 +6023,235 @@ def get_minimum_memory_from_helm_project():
     memory_baseline *= 10**6
     
     return cpu_baseline, memory_baseline
+
+
+def calculate_summary(
+    weighted_theta_results, 
+    weighted_tau_results, 
+    agg_df, 
+    c_bar_df,
+    w_theta_a,
+    w_tau_a,
+    w_theta_s,
+    w_tau_s,
+    w_s,
+    w_a,
+    w_c,
+    p,
+    ):
+
+    summary_df = pd.concat(
+        [
+            weighted_theta_results["autoscaler"],
+            weighted_theta_results["theta_mean"],
+            weighted_tau_results["tau_mean"],
+            agg_df["theta_a"],
+            agg_df["tau_a"],
+            c_bar_df["c_bar"],
+        ],
+        axis=1,
+    )
+
+    summary_df.rename(columns={
+        "theta_mean": "theta_s",
+        "tau_mean": "tau_s",
+        }, 
+        inplace=True
+    )
+
+    summary_df= calc_zeta(summary_df, w_theta_a, w_tau_a, w_theta_s, w_tau_s, w_s, w_a, w_c, p)
+    summary_df = summary_df[["autoscaler", "theta_s", "tau_s", "theta_a", "tau_a", "d_s", "d_a", "c_bar", "zeta",]]
+    summary_table_html = summary_df_to_html(summary_df)
+
+    return summary_df, summary_table_html
+
+
+def load_mathml_macros(params):
+
+    params["theta_rt_s"] = """<math xmlns="http://w3.org">
+        <msubsup>
+        <mi>&theta;</mi>
+        <mrow>
+            <mi>R</mi>
+            <mi>T</mi>
+        </mrow>
+        <mi>S</mi>
+        </msubsup>
+    </math>"""
+
+    params["theta_fr_s"] = """<math xmlns="http://w3.org">
+        <msubsup>
+        <mi>&theta;</mi>
+        <mrow>
+            <mi>F</mi>
+            <mi>R</mi>
+        </mrow>
+        <mi>S</mi>
+        </msubsup>
+    </math>"""
+
+    params["theta_s"] = """<math xmlns="http://w3.org">
+    <msup>
+        <mi>&theta;</mi>
+        <mi>S</mi>
+    </msup>
+    </math>"""
+
+    params["theta_a"] = """<math xmlns="http://w3.org">
+    <msup>
+        <mi>&theta;</mi>
+        <mi>A</mi>
+    </msup>
+    </math>"""
+
+    # Tau
+
+    params["tau_rt_s"] = """<math xmlns="http://w3.org">
+        <msubsup>
+        <mi>&tau;</mi>
+        <mrow>
+            <mi>R</mi>
+            <mi>T</mi>
+        </mrow>
+        <mi>S</mi>
+        </msubsup>
+    </math>"""
+
+
+    params["tau_fr_s"] = """<math xmlns="http://w3.org">
+        <msubsup>
+        <mi>&tau;</mi>
+        <mrow>
+            <mi>F</mi>
+            <mi>R</mi>
+        </mrow>
+        <mi>S</mi>
+        </msubsup>
+    </math>"""
+
+    params["tau_s"] = """<math xmlns="http://w3.org">
+    <msup>
+        <mi>&tau;</mi>
+        <mi>S</mi>
+    </msup>
+    </math>"""
+
+    params["tau_a"] = """<math xmlns="http://w3.org">
+    <msup>
+        <mi>&tau;</mi>
+        <mi>A</mi>
+    </msup>
+    </math>"""
+
+    params["bar_c"] = """<math xmlns="http://w3.org">
+    <mover>
+        <mi>C</mi>
+        <mo>&#xAF;</mo>
+    </mover>
+    </math>"""
+
+    params["zeta"] = """<math xmlns="http://www.w3.org/1998/Math/MathML">
+    <mi>&zeta;</mi>
+    </math>"""
+
+    # D
+
+    params["d_s"] = """<math xmlns="http://w3.org">
+    <msup>
+        <mi>D</mi>
+        <mi>S</mi>
+    </msup>
+    </math>"""
+
+    params["d_a"] = """<math xmlns="http://w3.org">
+    <msup>
+        <mi>D</mi>
+        <mi>A</mi>
+    </msup>
+    </math>"""
+
+    return params
+
+
+def load_autoscaler_descriptions(params):
+    params["autoscaler_descriptions"] = []
+
+    hpa_description = """ HPA is a threshold-based horizontal autoscaler.  Each deployment is configured with a single replica.  Initial
+    CPU and memory requests are established by a calibration process using a fixed workload set at the 15<sup>th</sup> percentile of 
+    benchmark workload.  CPU and memory limits were set at 6 cores and 6 GiB, an arbitrarily large number to permit bursting.  HPA was configured to allow scaling from 1 to 20 pods.  CPU and memory thresholds are set at 70%.  
+    The scale down stabilization was set at 75 seconds."""
+    params["autoscaler_descriptions"].append({
+        "name": "Kubernetes Horizontal Pod Autoscaler (HPA)",
+        "description": hpa_description
+    })
+
+    keda_description = """KEDA is a threshold-based horizontal pod autoscaler driven by events or other metrics.  In this evaluation, a hybrid configuration was
+    employed, using KEDA for asynchronous microservices and HPA for others.  KEDA monitored the depth of the Apache Kafka 
+    queues used for asynchronous processing.  The lag threshold was set to 10 items in the queue.  KEDA was configured with a minimum replica count of 1 and a 
+    maximum of 20 replicas.  The polling interval was 15 seconds.  The cool down period was set at 75 seconds.  For asynchronous services, HPA was
+    configured as described for the HPA-only evaluation."""
+    params["autoscaler_descriptions"].append({
+        "name": "Kubernetes Event-Driven Autoscaler (KEDA)",
+        "description": keda_description
+    })
+
+    vpa_description = """VPA is a threshold-based vertical pod autoscaler.  VPA initial resource requests and limits were the same as HPA.  
+    The minimum CPU was set the same as the requested CPU, as lower amounts were found to lead to instability.  The minimum memory was set based on 
+    experimentation to avoid fatal out-of-memory errors.  Each deployment was configured with two replicas to facilitate vertical 
+    scaling with no downtime.  The Pod Disruption Budget was set at a minimum of 1 replica."""
+    params["autoscaler_descriptions"].append({
+        "name": "Kubernetes Vertical Pod Autoscaler (VPA)",
+        "description": vpa_description
+    })
+
+    none_description = """As the control condition, evaluations are conducted with no autoscaling configured.  Deployments are configured
+    with the same requests and limits as the other tests and a fixed replica count of 1."""
+    params["autoscaler_descriptions"].append({
+        "name": "No Autoscaler (control condition)",
+        "description": none_description
+    })
+
+    return params
+
+async def render_report(template_dir, output_path, params, metadata):
+    # 1. Render your Jinja2 template exactly as before
+    env = jinja2.Environment(loader=jinja2.FileSystemLoader(template_dir))
+    template = env.get_template("fdr.html.jinja")
+    html_out = template.render(**params, **metadata)
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+    # Define a path for a temporary staging file inside TEMPLATE_DIR 
+    # This guarantees that relative links (like style.css) resolve flawlessly
+    temp_html_path = os.path.join(template_dir, "temp_render_stage.html")
+
+    try:
+        # Write the compiled HTML string to disk
+        with open(temp_html_path, "w", encoding="utf-8") as f:
+            f.write(html_out)
+
+        # 2. Open Playwright using the local file path
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            page = await browser.new_page()
+            
+            # Navigate to the file directly using an absolute file:// URI
+            file_url = f"file://{os.path.abspath(temp_html_path)}"
+            await page.goto(file_url)
+            
+            # Generate the print-ready PDF
+            await page.pdf(
+                path=output_path,
+                format="Letter",
+                print_background=True
+            )
+            
+            await browser.close()
+
+    finally:
+        # Clean up the staging file immediately so it doesn't clutter your workspace
+        if os.path.exists(temp_html_path):
+            os.remove(temp_html_path)
+
+    print(f"Wrote {output_path}")
+
