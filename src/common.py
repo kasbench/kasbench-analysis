@@ -5959,3 +5959,51 @@ def generate_performance_plots(log_df, files, s3_bucket, run_id):
     _, _, round_trip_filename = plot_roundtrip_completion_by_autoscaler(merged_trial_summary_df, show=False)
     
     return response_time_filename, failure_rate_filename, round_trip_filename
+
+def parse_cpu(cpu_string):
+    # Remove 'm' and convert to float
+    return float(cpu_string.replace('m', '')) / 1000
+
+def parse_memory(memory_string):
+    # Remove 'Mi' and convert to float
+    return float(memory_string.replace('Mi', ''))
+
+
+def get_minimum_memory_from_helm_project():
+    # Get the templates directory in helm project  
+    templates_dir = Path.cwd().parent / "globeco-helm" / "globeco" / "templates"
+
+    
+    # initialize cpu and memory accumulators
+    cpu_baseline = 0
+    memory_baseline = 0
+
+    # iterate the vpa.yaml files extracting the minimumbs
+
+    for file in templates_dir.rglob('vpa.yaml'):
+    
+        # Read the file
+        contents = file.read_text()
+
+        # Strip out the lines beginning with "{{"
+        contents = '\n'.join([line for line in contents.split('\n') if not line.strip().startswith('{{')])
+        
+        # load file as a yaml file using the pyaml library
+        data = yaml.safe_load(contents)
+        
+        # get the container name    
+        container_name = data['spec']['resourcePolicy']['containerPolicies'][0]['containerName']
+
+        # get the minimum cpu from spec.resourcePolicy.containerPolicies
+        min_cpu = data['spec']['resourcePolicy']['containerPolicies'][0]['minAllowed']['cpu']
+        
+        # get the minimum memory
+        min_memory = data['spec']['resourcePolicy']['containerPolicies'][0]['minAllowed']['memory']
+    
+        # increment cpu and memory totals
+        cpu_baseline += parse_cpu(min_cpu)
+        memory_baseline += parse_memory(min_memory)
+
+    memory_baseline *= 10**6
+    
+    return cpu_baseline, memory_baseline

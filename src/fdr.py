@@ -79,6 +79,12 @@ DEFAULT_ALPHA = 0.50
 DEFAULT_BETA = 0.50
 DEFAULT_K = 5
 DEFAULT_W_MAX = 1
+W_THETA_A = W_TAU_A = 0.50
+W_THETA_S = W_TAU_S = 0.50
+W_S = 0.40
+W_A = 0.40
+W_C = 0.20
+P = 3
 
 
 def _set_parameters(
@@ -248,13 +254,61 @@ def run_benchmark(
     # step 12: get the files in the S3 database for the run_id
     files = common.get_s3_file_listing(s3_bucket, run_id)
 
-    # step 13: generate performance plots
+    # step 13: generate performance plots and tables
     response_time_filename, failure_rate_filename, round_trip_filename = \
         common.generate_performance_plots(log_df, files, s3_bucket, run_id)
     params["response_time_plot_path"] = "../" + response_time_filename
     params["failure_rate_plot_path"] = "../" + failure_rate_filename
     params["round_trip_plot_path"] = "../" + round_trip_filename
-    
+    params["merged_trial_summary_table_html"] = common.merged_trial_summary_df_to_html(merged_trial_summary_df)
+    params["autoscaler_summary_table_html"] = common.autoscaler_summary_df_to_html(autoscaler_summary_df)
+
+    # step 14: get earliest and latest run times
+    earliest_run_time, latest_run_time = common.get_run_start_and_end_times_from_db(RUN_DB)
+
+    # step 15: calculate synchronous theta and tau
+    weighted_theta_results, theta_results, _ = common.calculate_weighted_synchronous_theta(log_df, earliest_run_time, latest_run_time,
+        slo_rt_ms=slo_rt_ms, slo_fr=slo_fr, k=K, alpha=alpha)
+    params["theta_table_html"] = common.weighted_synchronous_theta_to_html(weighted_theta_results)
+    weighted_tau_results, tau_results = common.calculate_weighted_synchronous_tau(log_df, earliest_run_time, latest_run_time,
+        slo_rt_ms=slo_rt_ms, slo_fr=slo_fr, tolerance=tolerance, alpha=ALPHA)
+    params["tau_table_html"] = common.weighted_synchronous_tau_to_html(weighted_tau_results)
+
+    # step 16: Get missing kafka metrics from TSDB snapshots (add this query to KASBench Runner)
+    query = "sum(rate(kafka_publish_success_total[2m]))"
+    client = docker.from_env()
+    port = 9099
+
+    arrival_rate_df = common.get_metric_from_tsdb(
+        s3_bucket,
+        files,
+        query,
+        client=client,
+        port=port)
+
+    # step 17: calculate asynchronous theta and tau
+    lag_df, agg_df = common.get_asynchronous_metrics(files, RUN, s3_bucket, earliest_run_time, latest_run_time,
+        time_slice_seconds=time_slice_seconds,
+        arrival_rate_df=arrival_rate_df, w_max=W_MAX, tolerance=tolerance, k=k)
+    params["asynchronous_metrics_table_html"] = common.weighted_asynchronous_metrics_df_to_html(agg_df)
+
+    # step 18: calculate the cost metric
+    cpu_baseline, memory_baseline = common.get_minimum_memory_from_helm_project()
+    c_bar_df = common.calculate_c_metric(
+        s3_bucket, 
+        RUN, 
+        earliest_run_time, 
+        latest_run_time, 
+        cpu_baseline,
+        memory_baseline,
+        MICROSERVICES,
+        TIME_SLICE_SECONDS, 
+        TOTAL_CPU,
+        TOTAL_MEMORY,
+        BETA)
+
+    params["cost_metrics_table_html"] = common.cost_metrics_df_to_html(c_bar_df)
+
     config = {
         "run": run_id,
         "sample_trial": sample_trial,
