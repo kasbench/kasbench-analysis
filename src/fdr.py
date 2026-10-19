@@ -237,6 +237,10 @@ def run_benchmark(
         s3_bucket, 
         report_date,
     )
+    # save metadata to a file
+    with open(f"{data_dir}/{run_id}-metadata.json", "w") as f:
+        json.dump(metadata, f, indent=2)
+
 
     # step 6: Set parameters
     params = _set_parameters(
@@ -259,6 +263,10 @@ def run_benchmark(
         p=P,
     )
 
+    # save params to json file
+    with open(f"{data_dir}/{run_id}-params.json", "w") as f:
+        json.dump(params, f, indent=2)
+
     # step 7: get Kubernetes-deployed container images
 
     deployments_table_html, statefulsets_table_html = common.compile_container_images(s3_bucket, run_id, sample_trial)
@@ -278,6 +286,14 @@ def run_benchmark(
 
     # step 9: get Helm chart versions
     helm_df = common.get_helm_versions(s3_bucket, run_id)
+    params["helm_versions_table_html"] = helm_df.to_html(
+        index=False,
+        escape=False,
+        header=True,
+        classes="data-table compact",
+        border=0
+    )
+
 
 
     # step 10 download the Locust database files and load them into a single database
@@ -285,6 +301,9 @@ def run_benchmark(
     
     # step 11: get the log as a dataframe
     log_df = common.get_log_as_dataframe(run_db)
+
+    # save log_df in parquet format
+    log_df.to_parquet(f"{data_dir}/{run_id}-log.parquet")
 
     # step 12: get the files in the S3 database for the run_id
     files = common.get_s3_file_listing(s3_bucket, run_id)
@@ -298,16 +317,51 @@ def run_benchmark(
     params["merged_trial_summary_table_html"] = common.merged_trial_summary_df_to_html(merged_trial_summary_df)
     params["autoscaler_summary_table_html"] = common.autoscaler_summary_df_to_html(autoscaler_summary_df)
 
+    # save merged_trial_summary_df in parquet format
+    merged_trial_summary_df.to_parquet(f"{data_dir}/{run_id}-trial-summary.parquet")
+
+    # save autoscaler_summary_df in parquet format
+    autoscaler_summary_df.to_parquet(f"{data_dir}/{run_id}-autoscaler-summary.parquet")
+
     # step 14: get earliest and latest run times
     earliest_run_time, latest_run_time = common.get_run_start_and_end_times_from_db(run_db)
 
     # step 15: calculate synchronous theta and tau
-    weighted_theta_results, theta_results, _ = common.calculate_weighted_synchronous_theta(log_df, earliest_run_time, latest_run_time,
+    weighted_theta_results, theta_results, theta_df = common.calculate_weighted_synchronous_theta(log_df, earliest_run_time, latest_run_time,
         slo_rt_ms=slo_rt_ms, slo_fr=slo_fr, k=k, alpha=alpha)
     params["theta_table_html"] = common.weighted_synchronous_theta_to_html(weighted_theta_results)
+    
     weighted_tau_results, tau_results = common.calculate_weighted_synchronous_tau(log_df, earliest_run_time, latest_run_time,
         slo_rt_ms=slo_rt_ms, slo_fr=slo_fr, tolerance=tolerance, alpha=alpha)
     params["tau_table_html"] = common.weighted_synchronous_tau_to_html(weighted_tau_results)
+
+    # save weighted_theta_results to parquet format
+    common.to_parquet_safe(weighted_theta_results, f"{data_dir}/{run_id}-weighted-synchronous-theta-results.parquet")
+    
+    # save theta_results.time_slices to parquet
+    common.to_parquet_safe(theta_results.time_slices, f"{data_dir}/{run_id}-synchronous-theta-time-slices.parquet")
+
+    # save theta_results.trials to parquet format
+    common.to_parquet_safe(theta_results.trials, f"{data_dir}/{run_id}-synchronous-theta-trials.parquet")
+
+    # save theta_results.autoscalers to parquet format
+    common.to_parquet_safe(theta_results.autoscalers, f"{data_dir}/{run_id}-synchronous-theta-autoscalers.parquet")
+
+    # save theta_df to parquet format
+    common.to_parquet_safe(theta_df, f"{data_dir}/{run_id}-synchronous-theta-results.parquet")
+
+    # save weighted_tau_results to parquet format
+    common.to_parquet_safe(weighted_tau_results, f"{data_dir}/{run_id}-weighted-synchronous-tau-results.parquet")
+
+    # save tau_results.time_slices to parquet format
+    common.to_parquet_safe(tau_results.time_slices, f"{data_dir}/{run_id}-synchronous-tau-time-slices.parquet")
+
+    # save tau_results.trials to parquet format
+    common.to_parquet_safe(tau_results.trials, f"{data_dir}/{run_id}-synchronous-tau-trials.parquet")
+
+    # save tau_results.autoscalers to parquet format
+    common.to_parquet_safe(tau_results.autoscalers, f"{data_dir}/{run_id}-synchronous-tau-autoscalers.parquet")
+
 
     # step 16: Get missing kafka metrics from TSDB snapshots (add this query to KASBench Runner)
     query = "sum(rate(kafka_publish_success_total[2m]))"
@@ -325,6 +379,11 @@ def run_benchmark(
     lag_df, agg_df = common.get_asynchronous_metrics(files, run_id, s3_bucket, earliest_run_time, latest_run_time,
         time_slice_seconds=time_slice_seconds,
         arrival_rate_df=arrival_rate_df, w_max=w_max, tolerance=tolerance, k=k)
+
+    # Save lag_df and agg_df in parquet format using common.to_parquet_safe
+    common.to_parquet_safe(lag_df, f"{data_dir}/{run_id}-asynchronous-lag.parquet")
+    common.to_parquet_safe(agg_df, f"{data_dir}/{run_id}-asynchronous-aggregated.parquet")
+
     params["asynchronous_metrics_table_html"] = common.weighted_asynchronous_metrics_df_to_html(agg_df)
 
     # step 18: calculate the cost metric
@@ -341,6 +400,8 @@ def run_benchmark(
         total_cpu,
         total_memory,
         beta)
+
+    common.to_parquet_safe(c_bar_df, f"{data_dir}/{run_id}-cost-metric.parquet")
 
     params["cost_metrics_table_html"] = common.cost_metrics_df_to_html(c_bar_df)
 
@@ -361,6 +422,8 @@ def run_benchmark(
         p,
     )
     params["summary_table_html"] = summary_table_html
+
+    common.to_parquet_safe(summary_df, f"{data_dir}/{run_id}-summary.parquet")
 
     # step 20: generate the summary plots
     

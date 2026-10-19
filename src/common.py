@@ -39,6 +39,58 @@ import docker
 s3 = boto3.client("s3")
 
 
+def _is_interval_like(dtype):
+    """True if ``dtype`` is an Interval dtype, or a Categorical whose
+    categories are intervals (as produced by ``pd.cut``)."""
+    if isinstance(dtype, pd.IntervalDtype):
+        return True
+    if isinstance(dtype, pd.CategoricalDtype):
+        return isinstance(dtype.categories.dtype, pd.IntervalDtype)
+    return False
+
+
+def intervals_to_edges(df):
+    """Return a copy of ``df`` with any interval-valued columns expanded into
+    plain ``*_start`` / ``*_end`` edge columns.
+
+    Parquet has no native representation for pandas interval values (e.g. the
+    tz-aware ``datetime64[us, UTC]`` intervals produced by ``pd.cut`` over a
+    ``pd.interval_range``), so ``to_parquet`` raises a ``TypeError`` on them.
+    This handles both a plain ``IntervalDtype`` column and the categorical that
+    ``pd.cut`` actually returns (a ``CategoricalDtype`` whose categories are
+    intervals), splitting each interval into its left/right edges, which
+    serialize cleanly.
+
+    The ``*_start`` / ``*_end`` columns preserve the interval edges' dtype
+    (including tz-aware timestamps). NaN intervals map to NaT/NaN edges. The
+    original interval can be reconstructed with
+    ``pd.IntervalIndex.from_arrays(df[f"{col}_start"], df[f"{col}_end"])``.
+
+    Non-interval columns are left untouched. Column order is preserved, with
+    the two edge columns inserted in place of the original interval column.
+    """
+    if not any(_is_interval_like(df[col].dtype) for col in df.columns):
+        return df
+
+    out = pd.DataFrame(index=df.index)
+    for col in df.columns:
+        if _is_interval_like(df[col].dtype):
+            # Coerce categorical-of-intervals to a plain IntervalArray so .left
+            # / .right expose the (possibly tz-aware) edge values directly.
+            intervals = pd.IntervalIndex(df[col].astype("interval"))
+            out[f"{col}_start"] = intervals.left
+            out[f"{col}_end"] = intervals.right
+        else:
+            out[col] = df[col]
+    return out
+
+
+def to_parquet_safe(df, path, **kwargs):
+    """Write ``df`` to Parquet, first expanding any Interval columns into
+    ``*_start`` / ``*_end`` edge columns via :func:`intervals_to_edges`."""
+    intervals_to_edges(df).to_parquet(path, **kwargs)
+
+
 def download_file_from_s3(s3_bucket, s3_key, local_path):
     """Download a file from S3 to a local path."""
     s3.download_file(s3_bucket, s3_key, local_path)
