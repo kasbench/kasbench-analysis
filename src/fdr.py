@@ -311,17 +311,19 @@ def run_benchmark(
     # step 13: generate performance plots and tables
     response_time_filename, failure_rate_filename, round_trip_filename, merged_trial_summary_df, autoscaler_summary_df = \
         common.generate_performance_plots(log_df, files, s3_bucket, run_id)
+   
+    # save merged_trial_summary_df in parquet format
+    merged_trial_summary_df.to_parquet(f"{data_dir}/{run_id}-trial-summary.parquet")
+
+    # save autoscaler_summary_df in parquet format
+    autoscaler_summary_df.to_parquet(f"{data_dir}/{run_id}-autoscaler-summary.parquet")
+
     params["response_time_plot_path"] =  os.path.abspath(response_time_filename)
     params["failure_rate_plot_path"] = os.path.abspath(failure_rate_filename)
     params["round_trip_plot_path"] = os.path.abspath(round_trip_filename)
     params["merged_trial_summary_table_html"] = common.merged_trial_summary_df_to_html(merged_trial_summary_df)
     params["autoscaler_summary_table_html"] = common.autoscaler_summary_df_to_html(autoscaler_summary_df)
 
-    # save merged_trial_summary_df in parquet format
-    merged_trial_summary_df.to_parquet(f"{data_dir}/{run_id}-trial-summary.parquet")
-
-    # save autoscaler_summary_df in parquet format
-    autoscaler_summary_df.to_parquet(f"{data_dir}/{run_id}-autoscaler-summary.parquet")
 
     # step 14: get earliest and latest run times
     earliest_run_time, latest_run_time = common.get_run_start_and_end_times_from_db(run_db)
@@ -376,19 +378,20 @@ def run_benchmark(
         port=port)
 
     # step 17: calculate asynchronous theta and tau
-    lag_df, agg_df = common.get_asynchronous_metrics(files, run_id, s3_bucket, earliest_run_time, latest_run_time,
+    lag_df, agg_df, agg_trial_df = common.get_asynchronous_metrics(files, run_id, s3_bucket, earliest_run_time, latest_run_time,
         time_slice_seconds=time_slice_seconds,
         arrival_rate_df=arrival_rate_df, w_max=w_max, tolerance=tolerance, k=k)
 
     # Save lag_df and agg_df in parquet format using common.to_parquet_safe
     common.to_parquet_safe(lag_df, f"{data_dir}/{run_id}-asynchronous-lag.parquet")
     common.to_parquet_safe(agg_df, f"{data_dir}/{run_id}-asynchronous-aggregated.parquet")
+    common.to_parquet_safe(agg_trial_df, f"{data_dir}/{run_id}-asynchronous-trial.parquet")
 
     params["asynchronous_metrics_table_html"] = common.weighted_asynchronous_metrics_df_to_html(agg_df)
 
     # step 18: calculate the cost metric
     cpu_baseline, memory_baseline = common.get_minimum_memory_from_helm_project()
-    c_bar_df = common.calculate_c_metric(
+    c_bar_df, c_bar_trial_df = common.calculate_c_metric(
         s3_bucket, 
         run_id, 
         earliest_run_time, 
@@ -402,6 +405,7 @@ def run_benchmark(
         beta)
 
     common.to_parquet_safe(c_bar_df, f"{data_dir}/{run_id}-cost-metric.parquet")
+    common.to_parquet_safe(c_bar_trial_df, f"{data_dir}/{run_id}-cost-metric-trials.parquet")
 
     params["cost_metrics_table_html"] = common.cost_metrics_df_to_html(c_bar_df)
 

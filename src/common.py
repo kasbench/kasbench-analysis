@@ -288,7 +288,7 @@ def get_autoscaler(run_details):
     return autoscaler    
 
 
-def get_trial_summary_df(df):
+def get_trial_summary_df_bad(df):
     """ Computes aggregates for each trial """
     df = df.copy()
     df["is_success"] = pd.to_numeric(df["status_code"], errors="coerce").between(200, 299)
@@ -317,6 +317,60 @@ def get_trial_summary_df(df):
     )
 
 
+def get_trial_summary_df(df):
+    """Computes aggregates for each trial including 99% tail latency."""
+    df = df.copy()
+    df["is_success"] = pd.to_numeric(
+        df["status_code"], errors="coerce"
+    ).between(200, 299)
+
+    response_time_summary = (
+        df[df["is_success"]]
+        .groupby(["autoscaler", "trial_id"], as_index=False)
+        .agg(
+            successful_requests=("status_code", "size"),
+            mean_response_time=("response_time", "mean"),
+            sd_response_time=("response_time", "std"),
+            p99_response_time=("response_time", lambda x: x.quantile(0.99)),
+        )
+    )
+    
+    unmodified_response_time_summary = (
+        df
+        .groupby(["autoscaler", "trial_id"], as_index=False)
+        .agg(
+            unmodified_mean_response_time=("response_time", "mean"),
+            sd_unmodified_response_time=("response_time", "std"),
+          
+        )
+    )
+
+    failure_rate_summary = df.groupby(
+        ["autoscaler", "trial_id"], as_index=False
+    ).agg(
+        requests=("status_code", "size"),
+        failures=("failure", "sum"),
+        failure_rate=("failure", "mean"),
+        sd_failure_rate=("failure", "std"),
+    )
+
+    response_time_summary = response_time_summary.merge(
+        unmodified_response_time_summary, on=["autoscaler", "trial_id"], how="outer"
+    )
+
+    summary_df = response_time_summary.merge(
+        failure_rate_summary, on=["autoscaler", "trial_id"], how="outer"
+    )
+
+    # Optional: Fill 0 for trials where no requests succeeded
+    summary_df["successful_requests"] = summary_df[
+        "successful_requests"
+    ].fillna(0)
+
+    return summary_df
+
+
+
 def get_autoscaler_summary(
     trial_summary: pd.DataFrame,
     confidence_level: float = 0.95,
@@ -336,6 +390,10 @@ def get_autoscaler_summary(
             mean_failure_rate=("failure_rate", "mean"),
             median_failure_rate=("failure_rate", "median"),
             sd_failure_rate=("failure_rate", "std"),
+
+            mean_p99_response_time=("p99_response_time", "mean"),
+            median_p99_response_time=("p99_response_time", "median"),
+            sd_p99_response_time=("p99_response_time", "std"),
 
             mean_roundtrip_completion_percentage=("roundtrip_completion_percentage", "mean"),
             median_roundtrip_completion_percentage=("roundtrip_completion_percentage", "median"),
@@ -2189,6 +2247,7 @@ def get_asynchronous_metrics(files, run_id, s3_bucket, earliest_start_time, late
         )
         .reset_index()
     )
+    agg_trial_df = agg_df.copy()
 
     # roll up to the autoscaler level
     agg_df = (
@@ -2205,7 +2264,7 @@ def get_asynchronous_metrics(files, run_id, s3_bucket, earliest_start_time, late
     )
 
     
-    return lag_df, agg_df
+    return lag_df, agg_df, agg_trial_df
         
 
 def get_tsdb_snapshots(files):
@@ -5427,6 +5486,8 @@ def calculate_c_metric(
         c_bar_cpu=("c_bar_cpu", "mean"),
         c_bar_mem=("c_bar_mem", "mean")
     ).reset_index()
+
+    c_bar_trial_df = c_bar_df.copy()
     
     
     # Calculate the mean of cores and bytes for each autoscaler
@@ -5451,7 +5512,7 @@ def calculate_c_metric(
     # Calulate c_bar
     c_bar_df["c_bar"] = beta * c_bar_df["c_bar_cpu"] + (1 - beta) * c_bar_df["c_bar_mem"]
 
-    return c_bar_df
+    return c_bar_df, c_bar_trial_df
 
 
 def cost_metrics_df_to_html(df):
