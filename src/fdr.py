@@ -42,7 +42,7 @@ DEFAULT_SAMPLE_TRIAL = "trial0001"  # Used to extract common infrastructure deta
 DEFAULT_SLO_RT_MS = 26.063374
 DEFAULT_SLO_FR = 0.000245
 
-DEFAULT_TOLERANCE = 0.20
+DEFAULT_TOLERANCE = 0.0
 
 DEFAULT_TOTAL_CPU = 32
 DEFAULT_TOTAL_MEMORY = 64_000_000_000
@@ -57,7 +57,7 @@ DEFAULT_AUTOSCALER_LOOKUP = {
     "none": "No autoscaler (control condition)",
 }
 
-DEFAULT_TIME_SLICE_SECONDS = 30
+DEFAULT_TIME_SLICE_SECONDS = 15
 
 DEFAULT_TITLE = "KASBench Full Disclosure Report"
 
@@ -187,6 +187,8 @@ def run_benchmark(
     w_a=W_A,
     w_c=W_C,
     p=P,
+    skip_locust_download=False,
+    load_log_from_parquet=False,
 ):
     """Run the full disclosure report benchmark.
 
@@ -195,6 +197,8 @@ def run_benchmark(
     (``data_dir`` and ``output_path``) are derived from ``run`` when left as
     ``None``.
     """
+
+    print(f"Skip Locust download: {skip_locust_download}")
 
     # Derived defaults that depend on `run`.
     if data_dir is None:
@@ -214,9 +218,10 @@ def run_benchmark(
     params = {}
     params["title"] = title
 
-    # step 1: Download the the benchmark database created by the benchmark controller
+    # step 1: Download the benchmark database created by the benchmark controller
     benchmark_db_path =f"{data_dir}/benchmark.db"
-    common.download_benchmark_db(s3_bucket, run_id, benchmark_db_path)
+    if not os.path.exists(benchmark_db_path):
+        common.download_benchmark_db(s3_bucket, run_id, benchmark_db_path)
 
     # step 2: Download the experiment progress
     experiment_progress = common.get_experiment_progress(s3_bucket, run_id)
@@ -297,21 +302,32 @@ def run_benchmark(
 
 
     # step 10 download the Locust database files and load them into a single database
-    common.download_and_load_locust_dbs(s3_bucket, run_id, run_db, data_dir)
+    if not skip_locust_download:
+        common.download_and_load_locust_dbs(s3_bucket, run_id, run_db, data_dir)
+    else:
+        print("Skipping Locust download.")
+    
     
     # step 11: get the log as a dataframe
-    log_df = common.get_log_as_dataframe(run_db)
+    if load_log_from_parquet:
+        print("Loading the log from a parquet file")
+        log_df = pd.read_parquet(f"{data_dir}/{run_id}-log.parquet")
+    else:
+        print("Getting the log as a dataframe")
+        log_df = common.get_log_as_dataframe(run_db)
 
-    # save log_df in parquet format
-    log_df.to_parquet(f"{data_dir}/{run_id}-log.parquet")
+        # save log_df in parquet format
+        log_df.to_parquet(f"{data_dir}/{run_id}-log.parquet")
 
     # step 12: get the files in the S3 database for the run_id
     files = common.get_s3_file_listing(s3_bucket, run_id)
 
     # step 13: generate performance plots and tables
+    print("Generating performance plots")
     response_time_filename, failure_rate_filename, round_trip_filename, merged_trial_summary_df, autoscaler_summary_df = \
         common.generate_performance_plots(log_df, files, s3_bucket, run_id)
-   
+    print("Performance plots generated")
+
     # save merged_trial_summary_df in parquet format
     merged_trial_summary_df.to_parquet(f"{data_dir}/{run_id}-trial-summary.parquet")
 
@@ -329,40 +345,44 @@ def run_benchmark(
     earliest_run_time, latest_run_time = common.get_run_start_and_end_times_from_db(run_db)
 
     # step 15: calculate synchronous theta and tau
+    print("Calculating synchronous theta and tau")
     weighted_theta_results, theta_results, theta_df = common.calculate_weighted_synchronous_theta(log_df, earliest_run_time, latest_run_time,
-        slo_rt_ms=slo_rt_ms, slo_fr=slo_fr, k=k, alpha=alpha)
+        slo_rt_ms=slo_rt_ms, slo_fr=slo_fr, k=k, alpha=alpha, time_slice_seconds=time_slice_seconds)
+    print("Done calculating synchronous theta and tau")
     params["theta_table_html"] = common.weighted_synchronous_theta_to_html(weighted_theta_results)
     
+    print("Calculating weighted synchronous tau")
     weighted_tau_results, tau_results = common.calculate_weighted_synchronous_tau(log_df, earliest_run_time, latest_run_time,
-        slo_rt_ms=slo_rt_ms, slo_fr=slo_fr, tolerance=tolerance, alpha=alpha)
+        slo_rt_ms=slo_rt_ms, slo_fr=slo_fr, tolerance=tolerance, alpha=alpha, time_slice_seconds=time_slice_seconds)
     params["tau_table_html"] = common.weighted_synchronous_tau_to_html(weighted_tau_results)
+    print("Done calculating weighted synchronous tau")
 
     # save weighted_theta_results to parquet format
-    common.to_parquet_safe(weighted_theta_results, f"{data_dir}/{run_id}-weighted-synchronous-theta-results.parquet")
+    common.to_parquet(weighted_theta_results, f"{data_dir}/{run_id}-weighted-synchronous-theta-results.parquet")
     
     # save theta_results.time_slices to parquet
     common.to_parquet_safe(theta_results.time_slices, f"{data_dir}/{run_id}-synchronous-theta-time-slices.parquet")
 
     # save theta_results.trials to parquet format
-    common.to_parquet_safe(theta_results.trials, f"{data_dir}/{run_id}-synchronous-theta-trials.parquet")
+    common.to_parquet(theta_results.trials, f"{data_dir}/{run_id}-synchronous-theta-trials.parquet")
 
     # save theta_results.autoscalers to parquet format
-    common.to_parquet_safe(theta_results.autoscalers, f"{data_dir}/{run_id}-synchronous-theta-autoscalers.parquet")
+    common.to_parquet(theta_results.autoscalers, f"{data_dir}/{run_id}-synchronous-theta-autoscalers.parquet")
 
     # save theta_df to parquet format
     common.to_parquet_safe(theta_df, f"{data_dir}/{run_id}-synchronous-theta-results.parquet")
 
     # save weighted_tau_results to parquet format
-    common.to_parquet_safe(weighted_tau_results, f"{data_dir}/{run_id}-weighted-synchronous-tau-results.parquet")
+    common.to_parquet(weighted_tau_results, f"{data_dir}/{run_id}-weighted-synchronous-tau-results.parquet")
 
     # save tau_results.time_slices to parquet format
     common.to_parquet_safe(tau_results.time_slices, f"{data_dir}/{run_id}-synchronous-tau-time-slices.parquet")
 
     # save tau_results.trials to parquet format
-    common.to_parquet_safe(tau_results.trials, f"{data_dir}/{run_id}-synchronous-tau-trials.parquet")
+    common.to_parquet(tau_results.trials, f"{data_dir}/{run_id}-synchronous-tau-trials.parquet")
 
     # save tau_results.autoscalers to parquet format
-    common.to_parquet_safe(tau_results.autoscalers, f"{data_dir}/{run_id}-synchronous-tau-autoscalers.parquet")
+    common.to_parquet(tau_results.autoscalers, f"{data_dir}/{run_id}-synchronous-tau-autoscalers.parquet")
 
 
     # step 16: Get missing kafka metrics from TSDB snapshots (add this query to KASBench Runner)
@@ -370,26 +390,32 @@ def run_benchmark(
     client = docker.from_env()
     port = 9099
 
+    print("Getting arrival rate")
     arrival_rate_df = common.get_metric_from_tsdb(
         s3_bucket,
         files,
         query,
         client=client,
         port=port)
+    print("Done getting arrival rate")
 
     # step 17: calculate asynchronous theta and tau
+    print("Calculating asynchronous theta and tau")
     lag_df, agg_df, agg_trial_df = common.get_asynchronous_metrics(files, run_id, s3_bucket, earliest_run_time, latest_run_time,
         time_slice_seconds=time_slice_seconds,
         arrival_rate_df=arrival_rate_df, w_max=w_max, tolerance=tolerance, k=k)
+    print("Done calculating asynchronous theta and tau")
 
     # Save lag_df and agg_df in parquet format using common.to_parquet_safe
-    common.to_parquet_safe(lag_df, f"{data_dir}/{run_id}-asynchronous-lag.parquet")
-    common.to_parquet_safe(agg_df, f"{data_dir}/{run_id}-asynchronous-aggregated.parquet")
-    common.to_parquet_safe(agg_trial_df, f"{data_dir}/{run_id}-asynchronous-trial.parquet")
+    common.to_parquet(agg_df, f"{data_dir}/{run_id}-asynchronous-aggregated.parquet")
+    common.to_parquet(agg_trial_df, f"{data_dir}/{run_id}-asynchronous-trial.parquet")
+    common.to_parquet_safe(lag_df, f"{data_dir}/{run_id}-lag.parquet")
+    
 
     params["asynchronous_metrics_table_html"] = common.weighted_asynchronous_metrics_df_to_html(agg_df)
 
     # step 18: calculate the cost metric
+    print("Calculating cost metric")
     cpu_baseline, memory_baseline = common.get_minimum_memory_from_helm_project()
     c_bar_df, c_bar_trial_df = common.calculate_c_metric(
         s3_bucket, 
@@ -403,14 +429,16 @@ def run_benchmark(
         total_cpu,
         total_memory,
         beta)
+    print("Done calculating cost metric")
 
-    common.to_parquet_safe(c_bar_df, f"{data_dir}/{run_id}-cost-metric.parquet")
-    common.to_parquet_safe(c_bar_trial_df, f"{data_dir}/{run_id}-cost-metric-trials.parquet")
+    common.to_parquet(c_bar_df, f"{data_dir}/{run_id}-cost-metric.parquet")
+    common.to_parquet(c_bar_trial_df, f"{data_dir}/{run_id}-cost-metric-trials.parquet")
 
     params["cost_metrics_table_html"] = common.cost_metrics_df_to_html(c_bar_df)
 
     # step 19: calculate the overall score
 
+    print("Calculating the overall score")
     summary_df, summary_table_html = common.calculate_summary(
         weighted_theta_results, 
         weighted_tau_results, 
@@ -425,12 +453,14 @@ def run_benchmark(
         w_c,
         p,
     )
+    print("Done calculating the overall score")
     params["summary_table_html"] = summary_table_html
 
-    common.to_parquet_safe(summary_df, f"{data_dir}/{run_id}-summary.parquet")
+    common.to_parquet(summary_df, f"{data_dir}/{run_id}-summary.parquet")
 
     # step 20: generate the summary plots
     
+    print("Generating summary plots")
     filename=os.path.abspath("./figures/summary-metrics-bar-chart.png")
     common.plot_summary_metrics_bar_chart(
         summary_df,
@@ -446,6 +476,7 @@ def run_benchmark(
     )
     params["summary_metrics_radar_chart"] = filename
 
+    print("Done generating summary plots")
 
     # step 21: load MathML macros
 
@@ -625,7 +656,7 @@ def build_arg_parser():
     )
     parser.add_argument(
         "--w-max",
-        type=int,
+        type=float,
         default=DEFAULT_W_MAX,
         help="Maximum weight. (default: %(default)s)",
     )
@@ -676,7 +707,20 @@ def build_arg_parser():
         type=int,
         default=P,
         help="P parameter. (default: %(default)s)",
+    )   
+    parser.add_argument(
+        "--skip_locust_download",
+        action="store_true",
+        default=False,
+        help="Skip downloading Locust images. (default: %(default)s)",
     )
+    parser.add_argument(
+        "--load_log_from_parquet",
+        action="store_true",
+        default=False,
+        help="Load the log from parquet. (default: %(default)s)",
+    )
+
 
     return parser
 
@@ -718,6 +762,8 @@ def main(argv=None):
         w_a=args.w_a,
         w_c=args.w_c,
         p=args.p,
+        skip_locust_download=args.skip_locust_download,
+        load_log_from_parquet=args.load_log_from_parquet,
     )
 
 

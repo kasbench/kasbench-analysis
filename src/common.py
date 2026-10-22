@@ -49,7 +49,7 @@ def _is_interval_like(dtype):
     return False
 
 
-def intervals_to_edges(df):
+def intervals_to_edges(df, name):
     """Return a copy of ``df`` with any interval-valued columns expanded into
     plain ``*_start`` / ``*_end`` edge columns.
 
@@ -70,6 +70,7 @@ def intervals_to_edges(df):
     the two edge columns inserted in place of the original interval column.
     """
     if not any(_is_interval_like(df[col].dtype) for col in df.columns):
+        print(f"{name} doesn't have intervals")
         return df
 
     out = pd.DataFrame(index=df.index)
@@ -85,10 +86,15 @@ def intervals_to_edges(df):
     return out
 
 
+def to_parquet(df, path, **kwargs):
+    """Write ``df`` to Parquet."""
+    df.to_parquet(path, **kwargs)
+
+
 def to_parquet_safe(df, path, **kwargs):
     """Write ``df`` to Parquet, first expanding any Interval columns into
     ``*_start`` / ``*_end`` edge columns via :func:`intervals_to_edges`."""
-    intervals_to_edges(df).to_parquet(path, **kwargs)
+    intervals_to_edges(df, path).to_parquet(path, **kwargs)
 
 
 def download_file_from_s3(s3_bucket, s3_key, local_path):
@@ -1323,6 +1329,7 @@ def calculate_tau_metrics(
     response_time_col: str = "response_time",
     failure_col: str = "failure",
     tolerance: float = 0.20,
+    status_code_col = "status_code",
 ) -> TauResults:
     """
     Calculate both tau time-share metrics:
@@ -1405,7 +1412,7 @@ def calculate_tau_metrics(
         time_slice_col,
         response_time_col,
         failure_col,
-        "status_code",
+        status_code_col,
     }
 
     missing_columns = required_columns.difference(requests_df.columns)
