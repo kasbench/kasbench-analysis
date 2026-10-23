@@ -345,10 +345,10 @@ def run_benchmark(
     earliest_run_time, latest_run_time = common.get_run_start_and_end_times_from_db(run_db)
 
     # step 15: calculate synchronous theta and tau
-    print("Calculating synchronous theta and tau")
+    print("Calculating synchronous theta")
     weighted_theta_results, theta_results, theta_df = common.calculate_weighted_synchronous_theta(log_df, earliest_run_time, latest_run_time,
         slo_rt_ms=slo_rt_ms, slo_fr=slo_fr, k=k, alpha=alpha, time_slice_seconds=time_slice_seconds)
-    print("Done calculating synchronous theta and tau")
+    print("Done calculating synchronous theta")
     params["theta_table_html"] = common.weighted_synchronous_theta_to_html(weighted_theta_results)
     
     print("Calculating weighted synchronous tau")
