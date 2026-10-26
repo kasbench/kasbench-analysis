@@ -39,8 +39,8 @@ DEFAULT_SAMPLE_TRIAL = "trial0001"  # Used to extract common infrastructure deta
 
 # SLO defaults. Note: the original module overrode the initial SLO values
 # (100 ms / 0.0001) with the baseline-run means below, so those are used here.
-DEFAULT_SLO_RT_MS = 26.063374
-DEFAULT_SLO_FR = 0.000245
+DEFAULT_SLO_RT_MS = 26.063374 * 2
+DEFAULT_SLO_FR = 0.000245 * 2
 
 DEFAULT_TOLERANCE = 0.0
 
@@ -526,6 +526,7 @@ def run_benchmark(
         "params": params,
     }
 
+    # print(config)
     return config
 
 

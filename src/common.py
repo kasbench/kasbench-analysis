@@ -5312,6 +5312,9 @@ def calculate_weighted_synchronous_tau(df, earliest_start_time, latest_end_time,
         slo_fr=0.01, alpha=0.50, time_slice_seconds=30, tolerance=0.20):
     """ Calculates weighted tau for a dataframe """
     
+    earliest_start_time -= datetime.timedelta(seconds=1)
+    latest_end_time += datetime.timedelta(seconds=time_slice_seconds)
+    
     df = df.copy()
     
     df = append_time_slice(
