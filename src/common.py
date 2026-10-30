@@ -33,6 +33,8 @@ import seaborn as sns
 from playwright.async_api import async_playwright
 import jinja2
 import docker
+from scipy.optimize import curve_fit
+
 
 
 
@@ -4239,96 +4241,43 @@ def download_and_load_locust_dbs(s3_bucket, run_id, run_db, data_dir):
         
 
 
-def _fit_line_to_means(
-    x_positions: np.ndarray,
-    means: np.ndarray,
-    confidence_level: float,
-    *,
-    num_points: int = 200,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict] | None:
+def _parse_scaling_levels(labels: list[str]) -> np.ndarray | None:
     """
-    Fit an ordinary-least-squares line to the per-class means and compute a
-    two-sided confidence band for the mean response (the regression line).
+    Parse a numeric scaling level N from each class label.
 
-    Parameters
-    ----------
-    x_positions:
-        Numeric x position for each class (e.g. 0, 1, 2, ...).
-
-    means:
-        The mean value for each class.
-
-    confidence_level:
-        Confidence level for the band around the fitted line.
-
-    num_points:
-        Number of points used to draw the smooth line and band.
-
-    Returns
-    -------
-    tuple or None
-        (x_line, y_line, ci_lower, ci_upper, stats_dict) where stats_dict
-        contains slope, intercept, and r-squared. Returns None when a line
-        cannot be fit (fewer than two classes, or fewer than three classes,
-        which leaves no residual degrees of freedom for a confidence band).
+    Recognizes labels of the form ``HORIZONTAL-<n>`` (case-insensitive), where
+    ``<n>`` is the replica count. Returns one float per label in the given
+    order, or None if any label does not contain such a level. When None is
+    returned, callers fall back to using the class position as N.
     """
-    x = np.asarray(x_positions, dtype=float)
-    y = np.asarray(means, dtype=float)
+    levels = []
+    for label in labels:
+        match = re.search(r"(\d+)", str(label))
+        if match is None:
+            return None
+        levels.append(float(match.group(1)))
+    return np.asarray(levels, dtype=float)
 
-    mask = np.isfinite(x) & np.isfinite(y)
-    x = x[mask]
-    y = y[mask]
 
-    n = len(x)
+def _usl_curve_to_positions(
+    x_line_n: np.ndarray,
+    n_values: np.ndarray,
+    positions: np.ndarray,
+) -> np.ndarray:
+    """
+    Map a USL curve expressed in N coordinates onto the categorical x-axis
+    positions used by the scatter and error bars.
 
-    # Need at least two points to fit a line, and at least three to have
-    # residual degrees of freedom for a confidence band.
-    if n < 3:
-        return None
-
-    # Ordinary least squares via numpy.
-    slope, intercept = np.polyfit(x, y, deg=1)
-
-    fitted = slope * x + intercept
-    residuals = y - fitted
-
-    degrees_of_freedom = n - 2
-    residual_variance = np.sum(residuals**2) / degrees_of_freedom
-
-    x_mean = x.mean()
-    sum_squared_x = np.sum((x - x_mean) ** 2)
-
-    if sum_squared_x == 0:
-        return None
-
-    x_line = np.linspace(x.min(), x.max(), num_points)
-    y_line = slope * x_line + intercept
-
-    # Standard error of the mean response at each x on the line.
-    se_fit = np.sqrt(
-        residual_variance
-        * (1.0 / n + (x_line - x_mean) ** 2 / sum_squared_x)
+    ``n_values`` and ``positions`` are paired samples (the replica count and
+    the plotted position of each class). The curve's N coordinates are linearly
+    interpolated onto positions so the fitted line aligns with the class ticks.
+    """
+    order = np.argsort(n_values)
+    return np.interp(
+        x_line_n,
+        np.asarray(n_values, dtype=float)[order],
+        np.asarray(positions, dtype=float)[order],
     )
-
-    alpha = 1 - confidence_level
-    critical_value = t.ppf(1 - alpha / 2, df=degrees_of_freedom)
-    half_width = critical_value * se_fit
-
-    ci_lower = y_line - half_width
-    ci_upper = y_line + half_width
-
-    ss_total = np.sum((y - y.mean()) ** 2)
-    r_squared = (
-        1 - np.sum(residuals**2) / ss_total if ss_total > 0 else np.nan
-    )
-
-    stats_dict = {
-        "slope": slope,
-        "intercept": intercept,
-        "r_squared": r_squared,
-    }
-
-    return x_line, y_line, ci_lower, ci_upper, stats_dict
 
 
 def plot_mean_response_time_by_autoscaler(
@@ -4377,7 +4326,7 @@ def plot_mean_response_time_by_autoscaler(
         Whether to render the axis title.
 
     show_fitted_line:
-        Whether to fit an ordinary-least-squares line to the per-autoscaler
+        Whether to fit the Universal Scalability Law to the per-autoscaler
         means and draw it with a two-sided confidence band. Defaults to True.
 
     Returns
@@ -4519,14 +4468,29 @@ def plot_mean_response_time_by_autoscaler(
             dtype=float,
         )
 
-        fit = _fit_line_to_means(
-            class_positions,
+        # Use the replica count parsed from HORIZONTAL-<n> labels as the USL
+        # load N; fall back to class position when labels are not scaling
+        # levels.
+        n_values = _parse_scaling_levels(autoscalers)
+        if n_values is None:
+            n_values = class_positions
+
+        fit = _fit_usl_to_means(
+            n_values,
             class_means,
             confidence_level,
         )
 
         if fit is not None:
-            x_line, y_line, ci_lower, ci_upper, _ = fit
+            x_line_n, y_line, ci_lower, ci_upper, fit_stats = fit
+            x_line = _usl_curve_to_positions(
+                x_line_n, n_values, class_positions
+            )
+
+            r_squared = fit_stats["r_squared"]
+            usl_label = "USL fit"
+            if np.isfinite(r_squared):
+                usl_label = f"USL fit ($R^2$ = {r_squared:.3f})"
 
             ax.fill_between(
                 x_line,
@@ -4535,7 +4499,7 @@ def plot_mean_response_time_by_autoscaler(
                 color="0.5",
                 alpha=0.18,
                 linewidth=0,
-                label=f"Fitted line {confidence_level:.0%} CI",
+                label=f"USL fit {confidence_level:.0%} CI",
                 zorder=1,
             )
 
@@ -4545,7 +4509,7 @@ def plot_mean_response_time_by_autoscaler(
                 color="0.3",
                 linestyle="--",
                 linewidth=1.8,
-                label="Fitted line",
+                label=usl_label,
                 zorder=1,
             )
 
@@ -4578,7 +4542,7 @@ def plot_mean_response_time_by_autoscaler(
         bbox_inches="tight",
     )
 
-    return fig, ax, filename
+    return fig, ax, filename, fit_stats
 
 
 
@@ -4621,7 +4585,7 @@ def plot_failure_rate_by_autoscaler(
         Seed used to make horizontal point jitter reproducible.
 
     show_fitted_line:
-        Whether to fit an ordinary-least-squares line to the per-autoscaler
+        Whether to fit the Universal Scalability Law to the per-autoscaler
         mean failure rates and draw it with a two-sided confidence band.
         Defaults to True.
 
@@ -4800,14 +4764,29 @@ def plot_failure_rate_by_autoscaler(
             dtype=float,
         )
 
-        fit = _fit_line_to_means(
-            class_positions,
+        # Use the replica count parsed from HORIZONTAL-<n> labels as the USL
+        # load N; fall back to class position when labels are not scaling
+        # levels.
+        n_values = _parse_scaling_levels(autoscalers)
+        if n_values is None:
+            n_values = class_positions
+
+        fit = _fit_usl_to_means(
+            n_values,
             class_means,
             confidence_level,
         )
 
         if fit is not None:
-            x_line, y_line, ci_lower, ci_upper, _ = fit
+            x_line_n, y_line, ci_lower, ci_upper, fit_stats = fit
+            x_line = _usl_curve_to_positions(
+                x_line_n, n_values, class_positions
+            )
+
+            r_squared = fit_stats["r_squared"]
+            usl_label = "USL fit"
+            if np.isfinite(r_squared):
+                usl_label = f"USL fit ($R^2$ = {r_squared:.3f})"
 
             # Percentages cannot fall below zero.
             ci_lower = np.clip(ci_lower, 0, None)
@@ -4820,7 +4799,7 @@ def plot_failure_rate_by_autoscaler(
                 color="0.5",
                 alpha=0.18,
                 linewidth=0,
-                label=f"Fitted line {confidence_level:.0%} CI",
+                label=f"USL fit {confidence_level:.0%} CI",
                 zorder=1,
             )
 
@@ -4830,7 +4809,7 @@ def plot_failure_rate_by_autoscaler(
                 color="0.3",
                 linestyle="--",
                 linewidth=1.8,
-                label="Fitted line",
+                label=usl_label,
                 zorder=1,
             )
 
@@ -4866,7 +4845,8 @@ def plot_failure_rate_by_autoscaler(
         bbox_inches="tight",
     )
 
-    return fig, ax, filename
+    return fig, ax, filename, fit_stats
+
 
 def plot_roundtrip_completion_by_autoscaler(
     trial_summary: pd.DataFrame,
@@ -4908,7 +4888,7 @@ def plot_roundtrip_completion_by_autoscaler(
         Seed used to make the horizontal jitter reproducible.
 
     show_fitted_line:
-        Whether to fit an ordinary-least-squares line to the per-autoscaler
+        Whether to fit the Universal Scalability Law to the per-autoscaler
         mean completion percentages and draw it with a two-sided confidence
         band. Defaults to True.
 
@@ -5130,14 +5110,29 @@ def plot_roundtrip_completion_by_autoscaler(
             dtype=float,
         )
 
-        fit = _fit_line_to_means(
-            class_positions,
+        # Use the replica count parsed from HORIZONTAL-<n> labels as the USL
+        # load N; fall back to class position when labels are not scaling
+        # levels.
+        n_values = _parse_scaling_levels(autoscalers)
+        if n_values is None:
+            n_values = class_positions
+
+        fit = _fit_usl_to_means(
+            n_values,
             class_means,
             confidence_level,
         )
 
         if fit is not None:
-            x_line, y_line, ci_lower, ci_upper, _ = fit
+            x_line_n, y_line, ci_lower, ci_upper, fit_stats = fit
+            x_line = _usl_curve_to_positions(
+                x_line_n, n_values, class_positions
+            )
+
+            r_squared = fit_stats["r_squared"]
+            usl_label = "USL fit"
+            if np.isfinite(r_squared):
+                usl_label = f"USL fit ($R^2$ = {r_squared:.3f})"
 
             # Completion percentages are bounded to [0, 100].
             ci_lower = np.clip(ci_lower, 0, 100)
@@ -5150,7 +5145,7 @@ def plot_roundtrip_completion_by_autoscaler(
                 color="0.5",
                 alpha=0.18,
                 linewidth=0,
-                label=f"Fitted line {confidence_level:.0%} CI",
+                label=f"USL fit {confidence_level:.0%} CI",
                 zorder=1,
             )
 
@@ -5160,7 +5155,7 @@ def plot_roundtrip_completion_by_autoscaler(
                 color="0.3",
                 linestyle="--",
                 linewidth=1.8,
-                label="Fitted line",
+                label=usl_label,
                 zorder=1,
             )
 
@@ -5203,7 +5198,7 @@ def plot_roundtrip_completion_by_autoscaler(
         bbox_inches="tight",
     )
 
-    return fig, ax, filename
+    return fig, ax, filename, fit_stats
 
 
 def images_to_html(images_df):
@@ -6610,4 +6605,190 @@ async def render_report(template_dir, output_path, params, metadata):
             os.remove(temp_html_path)
 
     print(f"Wrote {output_path}")
+
+
+def usl_model(n, alpha, beta, gamma):
+    """
+    Universal Scalability Law (Gunther) in throughput form.
+
+        X(N) = gamma * N / (1 + alpha * (N - 1) + beta * N * (N - 1))
+
+    Parameters
+    ----------
+    n:
+        Load / concurrency variable (N). Scalar or array.
+
+    alpha:
+        Contention coefficient (serialization).
+
+    beta:
+        Coherency / crosstalk coefficient.
+
+    gamma:
+        Single-unit throughput, X(1).
+
+    Returns
+    -------
+    numpy.ndarray or float
+        Modeled throughput at each N.
+    """
+    n = np.asarray(n, dtype=float)
+    return gamma * n / (1.0 + alpha * (n - 1.0) + beta * n * (n - 1.0))
+
+
+# def fit_usl(df, user_count):
+#     """Dynamically solves for alpha, beta, and gamma based on dataframe input."""
+#     subset = df.loc[user_count]
+#     x = subset.index.values
+#     y = subset['mean'].values
+#     popt, _ = curve_fit(usl_model, x, y, p0=[0.1, 0.01, y[0]], bounds=(0, [1, 1, np.inf]))
+#     return popt
+
+
+def _fit_usl_to_means(
+    n_values: np.ndarray,
+    means: np.ndarray,
+    confidence_level: float,
+    *,
+    num_points: int = 200,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict] | None:
+    """
+    Fit the Universal Scalability Law (:func:`usl_model`) to per-class means
+    and compute a two-sided confidence band for the fitted curve.
+
+    ``n_values`` is the USL load variable N for each class. For a horizontal
+    scaling experiment these are the true replica counts (e.g. 1, 2, 3, ...
+    parsed from ``HORIZONTAL-<n>`` labels), so the fitted alpha (contention)
+    and beta (coherency) parameters carry their usual scalability meaning. The
+    USL is defined for N >= 1 and normalized to its single-unit value at the
+    smallest N.
+
+    The confidence band is obtained by propagating the parameter covariance
+    returned by :func:`scipy.optimize.curve_fit` through the model Jacobian
+    (the delta method): ``var(y_hat) = J Sigma J^T``. The band half-width uses
+    a Student-t critical value with ``n - p`` residual degrees of freedom,
+    where ``p = 3`` is the number of USL parameters.
+
+    Parameters
+    ----------
+    n_values:
+        The USL load value N for each class (e.g. replica counts).
+
+    means:
+        The mean value for each class.
+
+    confidence_level:
+        Confidence level for the band around the fitted curve.
+
+    num_points:
+        Number of points used to draw the smooth curve and band.
+
+    Returns
+    -------
+    tuple or None
+        (x_line, y_line, ci_lower, ci_upper, stats_dict) where x_line is in
+        the same N coordinates as ``n_values`` and stats_dict holds the fitted
+        alpha, beta, gamma and r-squared. Returns None when the USL cannot be
+        fit (four or fewer classes leaves no residual degrees of freedom for a
+        band, or the optimizer fails to converge).
+    """
+    x = np.asarray(n_values, dtype=float)
+    y = np.asarray(means, dtype=float)
+
+    mask = np.isfinite(x) & np.isfinite(y)
+    x = x[mask]
+    y = y[mask]
+
+    n_points = len(x)
+    n_params = 3
+
+    # Need more observations than parameters to have residual degrees of
+    # freedom for a confidence band.
+    if n_points <= n_params:
+        return None
+
+    # Use the supplied N values directly, normalized so the smallest sits at
+    # N = 1 (the USL's single-unit reference point).
+    order = np.argsort(x)
+    x = x[order]
+    y = y[order]
+    n_load = x - x.min() + 1.0
+
+    # Reasonable starting guesses and non-negative bounds, matching fit_usl.
+    gamma0 = y[0] if y[0] > 0 else (np.nanmax(y) if np.nanmax(y) > 0 else 1.0)
+    p0 = [0.1, 0.01, gamma0]
+
+    try:
+        popt, pcov = curve_fit(
+            usl_model,
+            n_load,
+            y,
+            p0=p0,
+            bounds=(0, [np.inf, np.inf, np.inf]),
+            maxfev=10000,
+        )
+    except (RuntimeError, ValueError):
+        return None
+
+    if not np.all(np.isfinite(pcov)):
+        return None
+
+    alpha_hat, beta_hat, gamma_hat = popt
+
+    # Smooth curve over the observed load range.
+    n_line = np.linspace(n_load.min(), n_load.max(), num_points)
+    y_line = usl_model(n_line, *popt)
+
+    # Analytic Jacobian of usl_model with respect to (alpha, beta, gamma).
+    #
+    #   f = gamma * N / D,  D = 1 + alpha (N - 1) + beta N (N - 1)
+    #
+    #   df/dalpha = -gamma * N * (N - 1) / D^2
+    #   df/dbeta  = -gamma * N * N * (N - 1) / D^2
+    #   df/dgamma =  N / D
+    denom = (
+        1.0
+        + alpha_hat * (n_line - 1.0)
+        + beta_hat * n_line * (n_line - 1.0)
+    )
+
+    d_dalpha = -gamma_hat * n_line * (n_line - 1.0) / denom**2
+    d_dbeta = -gamma_hat * n_line * n_line * (n_line - 1.0) / denom**2
+    d_dgamma = n_line / denom
+
+    jac = np.column_stack([d_dalpha, d_dbeta, d_dgamma])
+
+    # Delta-method variance of the fitted curve at each point.
+    var_fit = np.einsum("ij,jk,ik->i", jac, pcov, jac)
+    var_fit = np.clip(var_fit, 0, None)
+    se_fit = np.sqrt(var_fit)
+
+    degrees_of_freedom = n_points - n_params
+    alpha_level = 1 - confidence_level
+    critical_value = t.ppf(1 - alpha_level / 2, df=degrees_of_freedom)
+    half_width = critical_value * se_fit
+
+    ci_lower = y_line - half_width
+    ci_upper = y_line + half_width
+
+    fitted = usl_model(n_load, *popt)
+    residuals = y - fitted
+    ss_total = np.sum((y - y.mean()) ** 2)
+    r_squared = (
+        1 - np.sum(residuals**2) / ss_total if ss_total > 0 else np.nan
+    )
+
+    # Map normalized load coordinates back to the supplied N coordinates.
+    x_line = n_line + x.min() - 1.0
+
+    stats_dict = {
+        "alpha": alpha_hat,
+        "beta": beta_hat,
+        "gamma": gamma_hat,
+        "r_squared": r_squared,
+    }
+
+    return x_line, y_line, ci_lower, ci_upper, stats_dict
+
+
 
