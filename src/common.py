@@ -4239,6 +4239,98 @@ def download_and_load_locust_dbs(s3_bucket, run_id, run_db, data_dir):
         
 
 
+def _fit_line_to_means(
+    x_positions: np.ndarray,
+    means: np.ndarray,
+    confidence_level: float,
+    *,
+    num_points: int = 200,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict] | None:
+    """
+    Fit an ordinary-least-squares line to the per-class means and compute a
+    two-sided confidence band for the mean response (the regression line).
+
+    Parameters
+    ----------
+    x_positions:
+        Numeric x position for each class (e.g. 0, 1, 2, ...).
+
+    means:
+        The mean value for each class.
+
+    confidence_level:
+        Confidence level for the band around the fitted line.
+
+    num_points:
+        Number of points used to draw the smooth line and band.
+
+    Returns
+    -------
+    tuple or None
+        (x_line, y_line, ci_lower, ci_upper, stats_dict) where stats_dict
+        contains slope, intercept, and r-squared. Returns None when a line
+        cannot be fit (fewer than two classes, or fewer than three classes,
+        which leaves no residual degrees of freedom for a confidence band).
+    """
+    x = np.asarray(x_positions, dtype=float)
+    y = np.asarray(means, dtype=float)
+
+    mask = np.isfinite(x) & np.isfinite(y)
+    x = x[mask]
+    y = y[mask]
+
+    n = len(x)
+
+    # Need at least two points to fit a line, and at least three to have
+    # residual degrees of freedom for a confidence band.
+    if n < 3:
+        return None
+
+    # Ordinary least squares via numpy.
+    slope, intercept = np.polyfit(x, y, deg=1)
+
+    fitted = slope * x + intercept
+    residuals = y - fitted
+
+    degrees_of_freedom = n - 2
+    residual_variance = np.sum(residuals**2) / degrees_of_freedom
+
+    x_mean = x.mean()
+    sum_squared_x = np.sum((x - x_mean) ** 2)
+
+    if sum_squared_x == 0:
+        return None
+
+    x_line = np.linspace(x.min(), x.max(), num_points)
+    y_line = slope * x_line + intercept
+
+    # Standard error of the mean response at each x on the line.
+    se_fit = np.sqrt(
+        residual_variance
+        * (1.0 / n + (x_line - x_mean) ** 2 / sum_squared_x)
+    )
+
+    alpha = 1 - confidence_level
+    critical_value = t.ppf(1 - alpha / 2, df=degrees_of_freedom)
+    half_width = critical_value * se_fit
+
+    ci_lower = y_line - half_width
+    ci_upper = y_line + half_width
+
+    ss_total = np.sum((y - y.mean()) ** 2)
+    r_squared = (
+        1 - np.sum(residuals**2) / ss_total if ss_total > 0 else np.nan
+    )
+
+    stats_dict = {
+        "slope": slope,
+        "intercept": intercept,
+        "r_squared": r_squared,
+    }
+
+    return x_line, y_line, ci_lower, ci_upper, stats_dict
+
+
 def plot_mean_response_time_by_autoscaler(
     trial_summary: pd.DataFrame,
     *,
@@ -4248,6 +4340,7 @@ def plot_mean_response_time_by_autoscaler(
     filename: str = "./figures/response_time_by_autoscaler.png",
     show: bool = False,
     include_title: bool = False,
+    show_fitted_line: bool = True,
 ) -> tuple[plt.Figure, plt.Axes, str]:
     """
     Plot trial-level mean response times by autoscaler.
@@ -4282,6 +4375,10 @@ def plot_mean_response_time_by_autoscaler(
 
     include_title:
         Whether to render the axis title.
+
+    show_fitted_line:
+        Whether to fit an ordinary-least-squares line to the per-autoscaler
+        means and draw it with a two-sided confidence band. Defaults to True.
 
     Returns
     -------
@@ -4415,6 +4512,43 @@ def plot_mean_response_time_by_autoscaler(
             }
         )
 
+    if show_fitted_line:
+        class_positions = np.arange(len(autoscalers), dtype=float)
+        class_means = np.array(
+            [row["mean_response_time"] for row in summary_rows],
+            dtype=float,
+        )
+
+        fit = _fit_line_to_means(
+            class_positions,
+            class_means,
+            confidence_level,
+        )
+
+        if fit is not None:
+            x_line, y_line, ci_lower, ci_upper, _ = fit
+
+            ax.fill_between(
+                x_line,
+                ci_lower,
+                ci_upper,
+                color="0.5",
+                alpha=0.18,
+                linewidth=0,
+                label=f"Fitted line {confidence_level:.0%} CI",
+                zorder=1,
+            )
+
+            ax.plot(
+                x_line,
+                y_line,
+                color="0.3",
+                linestyle="--",
+                linewidth=1.8,
+                label="Fitted line",
+                zorder=1,
+            )
+
     ax.set_xticks(range(len(autoscalers)))
     ax.set_xticklabels([autoscaler.upper() for autoscaler in autoscalers])
 
@@ -4457,6 +4591,7 @@ def plot_failure_rate_by_autoscaler(
     filename: str = "./figures/failure_rate_by_autoscaler.png",
     show: bool = False,
     include_title: bool = False,
+    show_fitted_line: bool = True,
 ) -> tuple[plt.Figure, plt.Axes]:
     """
     Plot trial-level failure rates by autoscaler.
@@ -4484,6 +4619,11 @@ def plot_failure_rate_by_autoscaler(
 
     random_seed:
         Seed used to make horizontal point jitter reproducible.
+
+    show_fitted_line:
+        Whether to fit an ordinary-least-squares line to the per-autoscaler
+        mean failure rates and draw it with a two-sided confidence band.
+        Defaults to True.
 
     Returns
     -------
@@ -4651,6 +4791,49 @@ def plot_failure_rate_by_autoscaler(
             }
         )
 
+    if show_fitted_line:
+        class_positions = np.arange(len(autoscalers), dtype=float)
+        # summary_rows stores mean_failure_rate as a proportion; the y-axis is
+        # in percent, so scale the means to match.
+        class_means = np.array(
+            [row["mean_failure_rate"] * 100 for row in summary_rows],
+            dtype=float,
+        )
+
+        fit = _fit_line_to_means(
+            class_positions,
+            class_means,
+            confidence_level,
+        )
+
+        if fit is not None:
+            x_line, y_line, ci_lower, ci_upper, _ = fit
+
+            # Percentages cannot fall below zero.
+            ci_lower = np.clip(ci_lower, 0, None)
+            ci_upper = np.clip(ci_upper, 0, None)
+
+            ax.fill_between(
+                x_line,
+                ci_lower,
+                ci_upper,
+                color="0.5",
+                alpha=0.18,
+                linewidth=0,
+                label=f"Fitted line {confidence_level:.0%} CI",
+                zorder=1,
+            )
+
+            ax.plot(
+                x_line,
+                y_line,
+                color="0.3",
+                linestyle="--",
+                linewidth=1.8,
+                label="Fitted line",
+                zorder=1,
+            )
+
     ax.set_xticks(range(len(autoscalers)))
     ax.set_xticklabels(
         [autoscaler.upper() for autoscaler in autoscalers]
@@ -4694,6 +4877,7 @@ def plot_roundtrip_completion_by_autoscaler(
     filename: str = "./figures/roundtrip_completion_by_autoscaler.png",
     show: bool = False,
     include_title: bool = False,
+    show_fitted_line: bool = True,
 ) -> tuple[plt.Figure, plt.Axes]:
     """
     Plot trial-level round-trip completion percentages by autoscaler.
@@ -4722,6 +4906,11 @@ def plot_roundtrip_completion_by_autoscaler(
 
     random_seed:
         Seed used to make the horizontal jitter reproducible.
+
+    show_fitted_line:
+        Whether to fit an ordinary-least-squares line to the per-autoscaler
+        mean completion percentages and draw it with a two-sided confidence
+        band. Defaults to True.
 
     Returns
     -------
@@ -4930,6 +5119,50 @@ def plot_roundtrip_completion_by_autoscaler(
                 "ci_upper": confidence_interval_upper,
             }
         )
+
+    if show_fitted_line:
+        class_positions = np.arange(len(autoscalers), dtype=float)
+        class_means = np.array(
+            [
+                row["mean_roundtrip_completion_percentage"]
+                for row in summary_rows
+            ],
+            dtype=float,
+        )
+
+        fit = _fit_line_to_means(
+            class_positions,
+            class_means,
+            confidence_level,
+        )
+
+        if fit is not None:
+            x_line, y_line, ci_lower, ci_upper, _ = fit
+
+            # Completion percentages are bounded to [0, 100].
+            ci_lower = np.clip(ci_lower, 0, 100)
+            ci_upper = np.clip(ci_upper, 0, 100)
+
+            ax.fill_between(
+                x_line,
+                ci_lower,
+                ci_upper,
+                color="0.5",
+                alpha=0.18,
+                linewidth=0,
+                label=f"Fitted line {confidence_level:.0%} CI",
+                zorder=1,
+            )
+
+            ax.plot(
+                x_line,
+                y_line,
+                color="0.3",
+                linestyle="--",
+                linewidth=1.8,
+                label="Fitted line",
+                zorder=1,
+            )
 
     ax.set_xticks(range(len(autoscalers)))
     ax.set_xticklabels(
