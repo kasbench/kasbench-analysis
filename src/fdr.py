@@ -39,8 +39,8 @@ DEFAULT_SAMPLE_TRIAL = "trial0001"  # Used to extract common infrastructure deta
 
 # SLO defaults. Note: the original module overrode the initial SLO values
 # (100 ms / 0.0001) with the baseline-run means below, so those are used here.
-DEFAULT_SLO_RT_MS = 26.063374 * 2
-DEFAULT_SLO_FR = 0.000245 * 2
+DEFAULT_SLO_RT_MS = 26.063374 # * 2
+DEFAULT_SLO_FR = 0.000245 # * 2
 
 DEFAULT_TOLERANCE = 0.0
 
@@ -82,9 +82,9 @@ DEFAULT_K = 5
 DEFAULT_W_MAX = 1
 W_THETA_A = W_TAU_A = 0.50
 W_THETA_S = W_TAU_S = 0.50
-W_S = 0.40
-W_A = 0.40
-W_C = 0.20
+W_S = 1.0/3.0
+W_A = 1.0/3.0
+W_C = 1.0/3.0
 P = 3
 
 
@@ -145,14 +145,14 @@ def _set_parameters(
 
     params["w_max"] = w_max
 
-    params["w_theta_a"] = W_THETA_A
-    params["w_tau_a"] = W_TAU_A
-    params["w_theta_s"] = W_THETA_S
-    params["w_tau_s"] = W_TAU_S
-    params["w_s"] = W_S
-    params["w_a"] = W_A
-    params["w_c"] = W_C
-    params["p"] = P
+    params["w_theta_a"] = w_theta_a
+    params["w_tau_a"] = w_tau_a
+    params["w_theta_s"] = w_theta_s
+    params["w_tau_s"] = w_tau_s
+    params["w_s"] = w_s
+    params["w_a"] = w_a
+    params["w_c"] = w_c
+    params["p"] = p
 
 
     return params
@@ -197,6 +197,8 @@ def run_benchmark(
     (``data_dir`` and ``output_path``) are derived from ``run`` when left as
     ``None``.
     """
+
+    assert w_s + w_a + w_c == 1.0, "The weights w_s, w_a, and w_c must sum to 1.0"
 
     print(f"Skip Locust download: {skip_locust_download}")
 

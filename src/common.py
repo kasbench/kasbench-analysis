@@ -6318,12 +6318,12 @@ def generate_performance_plots(log_df, files, s3_bucket, run_id):
     autoscaler_summary_df = get_autoscaler_summary(merged_trial_summary_df)
 
     # Generate mean response time by autoscaler plot
-    _, _, response_time_filename = plot_mean_response_time_by_autoscaler(trial_summary_df, show=False)
+    _, _, response_time_filename, _ = plot_mean_response_time_by_autoscaler(trial_summary_df, show=False)
     
     # Generate failure rate by autoscaler plot
-    _, _, failure_rate_filename = plot_failure_rate_by_autoscaler(merged_trial_summary_df, show=False)
+    _, _, failure_rate_filename, _ = plot_failure_rate_by_autoscaler(merged_trial_summary_df, show=False)
     
-    _, _, round_trip_filename = plot_roundtrip_completion_by_autoscaler(merged_trial_summary_df, show=False)
+    _, _, round_trip_filename, _ = plot_roundtrip_completion_by_autoscaler(merged_trial_summary_df, show=False)
     
     return response_time_filename, failure_rate_filename, round_trip_filename, merged_trial_summary_df, autoscaler_summary_df
 
