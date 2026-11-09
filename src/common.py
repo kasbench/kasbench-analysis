@@ -4290,6 +4290,7 @@ def plot_mean_response_time_by_autoscaler(
     show: bool = False,
     include_title: bool = False,
     show_fitted_line: bool = True,
+    x_label = None,
 ) -> tuple[plt.Figure, plt.Axes, str]:
     """
     Plot trial-level mean response times by autoscaler.
@@ -4516,7 +4517,11 @@ def plot_mean_response_time_by_autoscaler(
     ax.set_xticks(range(len(autoscalers)))
     ax.set_xticklabels([autoscaler.upper() for autoscaler in autoscalers])
 
-    ax.set_xlabel("Autoscaler")
+    if x_label is not None:
+        ax.set_xlabel(x_label)
+    else:
+        ax.set_xlabel("Autoscaler")
+
     ax.set_ylabel("Mean response time (ms)")
     if include_title:
         ax.set_title(
@@ -4556,6 +4561,7 @@ def plot_failure_rate_by_autoscaler(
     show: bool = False,
     include_title: bool = False,
     show_fitted_line: bool = True,
+    x_label = None,
 ) -> tuple[plt.Figure, plt.Axes]:
     """
     Plot trial-level failure rates by autoscaler.
@@ -4755,6 +4761,7 @@ def plot_failure_rate_by_autoscaler(
             }
         )
 
+    fit_stats = None
     if show_fitted_line:
         class_positions = np.arange(len(autoscalers), dtype=float)
         # summary_rows stores mean_failure_rate as a proportion; the y-axis is
@@ -4817,8 +4824,10 @@ def plot_failure_rate_by_autoscaler(
     ax.set_xticklabels(
         [autoscaler.upper() for autoscaler in autoscalers]
     )
-
-    ax.set_xlabel("Autoscaler")
+    if x_label is not None:
+        ax.set_xlabel(x_label)
+    else:
+        ax.set_xlabel("Autoscaler")
     ax.set_ylabel("Failure rate (%)")
     if include_title:
         ax.set_title(
@@ -4858,6 +4867,7 @@ def plot_roundtrip_completion_by_autoscaler(
     show: bool = False,
     include_title: bool = False,
     show_fitted_line: bool = True,
+    x_label = None,
 ) -> tuple[plt.Figure, plt.Axes]:
     """
     Plot trial-level round-trip completion percentages by autoscaler.
@@ -5100,6 +5110,7 @@ def plot_roundtrip_completion_by_autoscaler(
             }
         )
 
+    fit_stats = None
     if show_fitted_line:
         class_positions = np.arange(len(autoscalers), dtype=float)
         class_means = np.array(
@@ -5123,6 +5134,7 @@ def plot_roundtrip_completion_by_autoscaler(
             confidence_level,
         )
 
+        fit_stats = None
         if fit is not None:
             x_line_n, y_line, ci_lower, ci_upper, fit_stats = fit
             x_line = _usl_curve_to_positions(
@@ -5164,7 +5176,10 @@ def plot_roundtrip_completion_by_autoscaler(
         [autoscaler.upper() for autoscaler in autoscalers]
     )
 
-    ax.set_xlabel("Autoscaler")
+    if x_label:
+        ax.set_xlabel(x_label)
+    else:
+        ax.set_xlabel("Autoscaler")
     ax.set_ylabel("Round-trip completion percentage (%)")
 
     if include_title:
@@ -6790,5 +6805,429 @@ def _fit_usl_to_means(
 
     return x_line, y_line, ci_lower, ci_upper, stats_dict
 
+
+def plot_mean_response_time_by_replicas(
+    trial_summary: pd.DataFrame,
+    *,
+    autoscaler_order: list[str] | None = None,
+    confidence_level: float = 0.95,
+    random_seed: int = 42,
+    filename: str = "./figures/response_time_by_replicas.png",
+    show: bool = False,
+    include_title: bool = False,
+    show_fitted_line: bool = True,
+    x_label: str | None = None,
+) -> tuple[plt.Figure, plt.Axes, str, dict | None]:
+    """
+    Plot trial-level mean response times by replica count.
+
+    Each small point represents one trial. Larger points represent
+    unweighted means across trials, with two-sided Student-t
+    confidence intervals.
+
+    Optionally fit the empirical response-time model:
+
+        R(N) = a + b/N
+
+    where:
+        N = replica count
+        a = asymptotic response-time floor
+        b = replication-sensitive response-time component
+
+    The model is descriptive, not a formal application of USL.
+
+    Fitting uses weighted least squares on replica-level means,
+    with weights based on the estimated variance of each mean.
+    A delta-method confidence band is computed using the
+    fitted parameter covariance.
+
+    Returns
+    -------
+    (fig, ax, filename, fit_stats)
+
+    fit_stats is None if fitting is disabled or cannot be
+    performed.
+    """
+    from pathlib import Path
+
+    from scipy.stats import t
+
+    required = {
+        "autoscaler",
+        "trial_id",
+        "mean_response_time",
+    }
+    missing = required - set(trial_summary.columns)
+    if missing:
+        raise ValueError(
+            f"Missing required columns: {sorted(missing)}"
+        )
+
+    if not 0 < confidence_level < 1:
+        raise ValueError(
+            "confidence_level must be between 0 and 1."
+        )
+
+    df = trial_summary[
+        ["autoscaler", "trial_id", "mean_response_time"]
+    ].copy()
+
+    df["mean_response_time"] = pd.to_numeric(
+        df["mean_response_time"], errors="coerce"
+    )
+
+    if df["mean_response_time"].isna().any():
+        raise ValueError(
+            "mean_response_time contains missing or "
+            "nonnumeric values."
+        )
+
+    if (df["mean_response_time"] < 0).any():
+        raise ValueError(
+            "Response times must be nonnegative."
+        )
+
+    # Parse actual replica counts from labels such as
+    # HORIZONTAL-1, HORIZONTAL-2, etc.
+    labels = df["autoscaler"].dropna().unique().tolist()
+
+    if len(labels) != df["autoscaler"].nunique(dropna=False):
+        raise ValueError("autoscaler contains missing values.")
+
+    parsed = _parse_scaling_levels(labels)
+
+    if parsed is None:
+        raise ValueError(
+            "All autoscaler labels must encode replica counts "
+            "(e.g., HORIZONTAL-1, HORIZONTAL-2)."
+        )
+
+    replica_map = {
+        label: float(n)
+        for label, n in zip(labels, parsed)
+    }
+
+    if any(
+        not np.isfinite(n) or n < 1 or not float(n).is_integer()
+        for n in replica_map.values()
+    ):
+        raise ValueError(
+            "Replica counts must be positive integers."
+        )
+
+    if len(set(replica_map.values())) != len(replica_map):
+        raise ValueError(
+            "Each category must represent a unique replica count."
+        )
+
+    # Retain autoscaler_order for compatibility, but display
+    # replica counts in numerical order.
+    if autoscaler_order is not None:
+        unknown = set(autoscaler_order) - set(labels)
+        if unknown:
+            raise ValueError(
+                f"Unknown autoscaler labels: {sorted(unknown)}"
+            )
+
+    ordered_labels = sorted(
+        labels, key=lambda label: replica_map[label]
+    )
+
+    rng = np.random.default_rng(random_seed)
+    fig, ax = plt.subplots(figsize=(8, 5.5))
+
+    alpha_level = 1 - confidence_level
+    summary_rows = []
+
+    for index, label in enumerate(ordered_labels):
+        n = replica_map[label]
+
+        values = df.loc[
+            df["autoscaler"] == label,
+            "mean_response_time",
+        ].to_numpy(dtype=float)
+
+        count = len(values)
+        mean_rt = float(np.mean(values))
+
+        if count >= 2:
+            sd = float(np.std(values, ddof=1))
+            se = sd / np.sqrt(count)
+            critical = t.ppf(
+                1 - alpha_level / 2,
+                df=count - 1,
+            )
+            half_width = critical * se
+        else:
+            sd = np.nan
+            se = np.nan
+            half_width = np.nan
+
+        jitter = rng.normal(
+            loc=0.0,
+            scale=0.045,
+            size=count,
+        )
+
+        ax.scatter(
+            n + jitter,
+            values,
+            s=45,
+            alpha=0.65,
+            label="Individual trial" if index == 0 else None,
+            zorder=2,
+        )
+
+        if np.isfinite(half_width):
+            ax.errorbar(
+                n,
+                mean_rt,
+                yerr=half_width,
+                fmt="o",
+                markersize=9,
+                capsize=7,
+                capthick=1.5,
+                linewidth=2,
+                label=(
+                    f"Mean and {confidence_level:.0%} CI"
+                    if index == 0 else None
+                ),
+                zorder=3,
+            )
+        else:
+            ax.plot(
+                n,
+                mean_rt,
+                "o",
+                markersize=9,
+                label=(
+                    "Mean (CI unavailable)"
+                    if index == 0 else None
+                ),
+                zorder=3,
+            )
+
+        summary_rows.append({
+            "autoscaler": label,
+            "replicas": int(n),
+            "trials": count,
+            "mean_response_time": mean_rt,
+            "sd_response_time": sd,
+            "se_response_time": se,
+            "ci_lower": (
+                max(0, mean_rt - half_width)
+                if np.isfinite(half_width)
+                else np.nan
+            ),
+            "ci_upper": (
+                mean_rt + half_width
+                if np.isfinite(half_width)
+                else np.nan
+            ),
+        })
+
+    summary = pd.DataFrame(summary_rows)
+    fit_stats = None
+
+    if show_fitted_line:
+        x = summary["replicas"].to_numpy(dtype=float)
+        y = summary["mean_response_time"].to_numpy(
+            dtype=float
+        )
+        se = summary["se_response_time"].to_numpy(
+            dtype=float
+        )
+
+        # Require at least three replica levels so that the
+        # two-parameter fit has residual degrees of freedom.
+        if len(x) >= 3:
+            # Estimate variances of group means.
+            variances = se**2
+
+            valid = (
+                np.isfinite(variances)
+                & (variances > 0)
+            )
+
+            if valid.any():
+                # Replace missing/zero variances with the
+                # median positive variance. This prevents
+                # infinite weights.
+                fallback = float(
+                    np.median(variances[valid])
+                )
+                variances[~valid] = fallback
+
+                weights = 1.0 / variances
+
+                # Weighted linear regression:
+                # R(N) = a + b * (1/N)
+                X = np.column_stack([
+                    np.ones_like(x),
+                    1.0 / x,
+                ])
+
+                sqrt_w = np.sqrt(weights)
+                Xw = X * sqrt_w[:, None]
+                yw = y * sqrt_w
+
+                coefficients, _, rank, _ = np.linalg.lstsq(
+                    Xw, yw, rcond=None
+                )
+
+                if rank == 2:
+                    a_hat, b_hat = coefficients
+
+                    fitted = X @ coefficients
+                    residuals = y - fitted
+
+                    df_resid = len(x) - 2
+
+                    weighted_sse = float(
+                        np.sum(weights * residuals**2)
+                    )
+
+                    # Conventional WLS covariance estimate.
+                    covariance = (
+                        np.linalg.inv(Xw.T @ Xw)
+                        * weighted_sse
+                        / df_resid
+                    )
+
+                    x_line = np.linspace(
+                        x.min(), x.max(), 200
+                    )
+
+                    X_line = np.column_stack([
+                        np.ones_like(x_line),
+                        1.0 / x_line,
+                    ])
+
+                    y_line = X_line @ coefficients
+
+                    var_fit = np.einsum(
+                        "ij,jk,ik->i",
+                        X_line,
+                        covariance,
+                        X_line,
+                    )
+                    se_fit = np.sqrt(
+                        np.maximum(var_fit, 0)
+                    )
+
+                    critical = t.ppf(
+                        1 - alpha_level / 2,
+                        df=df_resid,
+                    )
+
+                    half_width = critical * se_fit
+
+                    ci_lower = np.maximum(
+                        0, y_line - half_width
+                    )
+                    ci_upper = y_line + half_width
+
+                    ax.fill_between(
+                        x_line,
+                        ci_lower,
+                        ci_upper,
+                        color="0.5",
+                        alpha=0.18,
+                        linewidth=0,
+                        label=(
+                            f"Empirical fit "
+                            f"{confidence_level:.0%} CI"
+                        ),
+                        zorder=1,
+                    )
+
+                    ax.plot(
+                        x_line,
+                        y_line,
+                        color="0.3",
+                        linestyle="--",
+                        linewidth=1.8,
+                        label="Inverse-plus-asymptote fit",
+                        zorder=1,
+                    )
+
+                    ss_total = np.sum(
+                        (y - np.mean(y))**2
+                    )
+                    ss_residual = np.sum(
+                        residuals**2
+                    )
+
+                    r_squared = (
+                        1 - ss_residual / ss_total
+                        if ss_total > 0
+                        else np.nan
+                    )
+
+                    weighted_mean = np.average(
+                        y, weights=weights
+                    )
+                    weighted_total = np.sum(
+                        weights * (y - weighted_mean)**2
+                    )
+                    weighted_r_squared = (
+                        1 - weighted_sse / weighted_total
+                        if weighted_total > 0
+                        else np.nan
+                    )
+
+                    fit_stats = {
+                        "model": "a + b/N",
+                        "a": float(a_hat),
+                        "b": float(b_hat),
+                        "r_squared": float(r_squared),
+                        "weighted_r_squared": float(
+                            weighted_r_squared
+                        ),
+                        "residual_df": df_resid,
+                        "weighted_sse": weighted_sse,
+                        "covariance": covariance,
+                        "n_replica_levels": len(x),
+                    }
+
+    ax.set_xticks(
+        summary["replicas"].to_numpy(dtype=int)
+    )
+
+    ax.set_xlabel(
+        x_label if x_label is not None else "Replicas"
+    )
+    ax.set_ylabel("Mean response time (ms)")
+
+    if include_title:
+        ax.set_title(
+            "Mean Response Time by Replica Count\n"
+            "Trial-level means with overall mean and "
+            f"{confidence_level:.0%} confidence interval"
+        )
+
+    ax.set_ylim(bottom=0)
+    ax.grid(axis="y", alpha=0.25)
+    ax.legend()
+
+    fig.tight_layout()
+
+    ax.response_time_summary = summary
+    ax.response_time_fit_stats = fit_stats
+
+    Path(filename).parent.mkdir(
+        parents=True, exist_ok=True
+    )
+
+    fig.savefig(
+        filename,
+        dpi=300,
+        bbox_inches="tight",
+    )
+
+    if show:
+        plt.show()
+
+    return fig, ax, filename, fit_stats
 
 
