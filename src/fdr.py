@@ -55,6 +55,12 @@ DEFAULT_AUTOSCALER_LOOKUP = {
     "vpa": "Kubernetes Vertical Pod Autoscaler (VPA)",
     "keda": "Kubernetes Event-Driven Autoscaler (KEDA)",
     "none": "No autoscaler (control condition)",
+    "horizontal-1": "horizontal-1",
+    "horizontal-2": "horizontal-2",
+    "horizontal-3": "horizontal-3",
+    "horizontal-4": "horizontal-4",
+    "horizontal-5": "horizontal-5",
+    
 }
 
 DEFAULT_TIME_SLICE_SECONDS = 15

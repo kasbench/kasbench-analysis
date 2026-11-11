@@ -2873,6 +2873,7 @@ def plot_cpu_allocation(
     saturation_threshold=0.95,
     autoscaler_order=("none", "hpa", "vpa", "keda"),
     figsize=None,
+    show_replicas=False,
 ):
     """
     Plot node CPU allocation pressure over elapsed benchmark time.
@@ -3102,13 +3103,19 @@ def plot_cpu_allocation(
             linewidth=1.0,
         )
 
+        if show_replicas:
+            title = f'{autoscaler} {"Replica" if autoscaler == 1 else "Replicas"}'
+        else:
+            title = autoscaler.upper() if autoscaler != "none" else "No autoscaler"
+
         ax.set_title(
-            autoscaler.upper() if autoscaler != "none" else "No autoscaler",
+            title,
             loc="left",
             fontweight="bold",
         )
 
         ax.set_ylabel("CPU allocation (%)")
+        ax.set_ylim(bottom=0)
 
         ax.grid(
             axis="y",
