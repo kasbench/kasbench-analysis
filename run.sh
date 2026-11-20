@@ -1,4 +1,4 @@
-uv run src/fdr.py --run-id="experiment-1-run-60m-7rep-b" \
+uv run src/fdr.py --run-id="pre-test-large-vpa-1" \
 --skip_locust_download \
 --load_log_from_parquet \
 --w-max 0.131056 \
